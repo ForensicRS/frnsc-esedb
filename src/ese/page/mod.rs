@@ -1,13 +1,16 @@
-use branch::BranchHeader;
+use branch::BranchPage;
 use forensic_rs::err::{BadFormatError, ForensicError, ForensicResult};
 use key::PageKeyRef;
-use root::RootHeader;
+use leaf::LeafPage;
+use root::{RootHeader, RootPage};
 
-use super::{header::Header, tag::Tag};
+use super::{header::Header, tag::{Tag, TagReader}};
 
 pub mod root;
 pub mod branch;
 pub mod key;
+pub mod leaf;
+pub mod entries;
 
 pub const ROOT_PAGE_FLAG : u32 = 0x00000001;
 pub const LEAF_PAGE_FLAG : u32 = 0x00000002;
@@ -16,12 +19,27 @@ pub const EMPTY_PAGE_FLAG : u32 = 0x00000008;
 pub const SPACE_TREE_PAGE_FLAG : u32 = 0x00000020;
 pub const INDEX_PAGE_FLAG : u32 = 0x00000040;
 pub const LONG_VALUE_PAGE_FLAG : u32 = 0x00000080;
+pub const ERASED_PAGE_FLAG : u32 = 0x00004000;
+pub const REPAIRED_PAGE_FLAG : u32 = 0x200000;
 
 #[derive(Clone, Debug)]
-pub enum TreePageHeader {
-    Root(RootHeader),
-    Branch(BranchHeader)
+pub enum TreePage<'a> {
+    Root(RootPage<'a>),
+    Branch(BranchPage<'a>),
+    Leaf(LeafPage<'a>)
 }
+
+#[derive(Clone, Debug)]
+pub enum PageFlag {
+    Root,
+    Leaf,
+    Parent,
+    Empty,
+    SpaceTree,
+    Index,
+    LongValue
+}
+
 #[repr(packed)]
 pub struct PageHeaderExchange2003Repr {
     pub xor : u32,
@@ -36,6 +54,7 @@ pub struct PageHeaderExchange2003Repr {
     pub available_page_tag : u16,
     pub page_flags : u32
 }
+#[derive(Clone, Debug)]
 pub struct PageChecksumExchange2003 {
     pub xor : u32,
     pub page_number : u32
@@ -55,6 +74,7 @@ pub struct PageHeaderWinVistaRepr {
     pub available_page_tag : u16,
     pub page_flags : u32
 }
+#[derive(Clone, Debug)]
 pub struct PageChecksumWinVista {
     pub xor_checksum : u32,
     pub ecc_checksum : u32
@@ -78,6 +98,7 @@ pub struct PageHeaderWin7ExtRepr {
     pub unknown : u64
 }
 
+#[derive(Clone, Debug)]
 pub struct PageChecksumWin7 {
     pub checksum : u64
 }
@@ -95,7 +116,7 @@ pub struct PageHeaderRepr {
     pub available_page_tag : u16,
     pub page_flags : u32
 }
-
+#[derive(Clone, Debug)]
 pub enum PageChecksum {
     Exchange2003(PageChecksumExchange2003),
     WinVista(PageChecksumWinVista),
@@ -133,11 +154,11 @@ impl<'a> TryFrom<&'a PageChecksum> for &'a PageChecksumWinVista {
         }
     }
 }
-
+#[derive(Clone, Debug)]
 pub enum PageExtension {
     Win7(PageExtensionWin7)
 }
-
+#[derive(Clone, Debug)]
 pub struct PageExtensionWin7 {
     pub ext_checksum1 : u64,
     pub ext_checksum2 : u64,
@@ -146,7 +167,7 @@ pub struct PageExtensionWin7 {
     pub unknown : u64
 }
 
-
+#[derive(Clone, Debug)]
 pub struct PageHeader {
     pub checksum : PageChecksum,
     pub last_modification_time : u64,
@@ -231,18 +252,68 @@ impl PageHeader {
         Ok(page)
     }
 
+    pub fn is_branch(&self) -> bool {
+        self.page_flags & (ROOT_PAGE_FLAG | LEAF_PAGE_FLAG | INDEX_PAGE_FLAG | SPACE_TREE_PAGE_FLAG | LONG_VALUE_PAGE_FLAG) == 0
+    }
+
     pub fn is_root(&self) -> bool {
         self.page_flags & ROOT_PAGE_FLAG > 0
     }
-    pub fn is_branch(&self) -> bool {
-        !self.is_root() && !self.is_leaf()
-    }
+
     pub fn is_leaf(&self) -> bool {
         self.page_flags & LEAF_PAGE_FLAG > 0
     }
+    pub fn is_long_value(&self) -> bool {
+        self.page_flags & LONG_VALUE_PAGE_FLAG > 0
+    }
+    pub fn is_empty_flag(&self) -> bool {
+        self.page_flags & EMPTY_PAGE_FLAG > 0
+    }
+    pub fn is_index(&self) -> bool {
+        self.page_flags & INDEX_PAGE_FLAG > 0
+    }
 
+    pub fn is_parent(&self) -> bool {
+        self.page_flags & PARENT_PAGE_FLAG > 0
+    }
+    pub fn is_space_tree(&self) -> bool {
+        self.page_flags & SPACE_TREE_PAGE_FLAG > 0
+    }
+    pub fn is_erased(&self) -> bool {
+        self.page_flags & ERASED_PAGE_FLAG > 0
+    }
+    pub fn is_repaired(&self) -> bool {
+        self.page_flags & REPAIRED_PAGE_FLAG > 0
+    }
+
+    pub fn flags(&self) -> Vec<PageFlag> {
+        let mut flags = Vec::with_capacity(8);
+        if self.is_root() {
+            flags.push(PageFlag::Root);
+        }
+        if self.is_leaf() {
+            flags.push(PageFlag::Leaf);
+        }
+        if self.is_long_value() {
+            flags.push(PageFlag::LongValue);
+        }
+        if self.is_empty_flag() {
+            flags.push(PageFlag::Empty);
+        }
+        if self.is_index() {
+            flags.push(PageFlag::Index);
+        }
+        if self.is_parent() {
+            flags.push(PageFlag::Parent);
+        }
+        if self.is_space_tree() {
+            flags.push(PageFlag::SpaceTree);
+        }
+        flags
+    }
 }
 
+#[derive(Clone, Debug)]
 pub struct Page {
     pub page_number : u32,
     pub data : Vec<u8>,
@@ -257,20 +328,35 @@ impl Page {
             return Err(ForensicError::bad_format_str("Page data size does not match Header page size"))
         }
         let page_header = PageHeader::from_buff(&data, header.version, header.file_format_revision)?;
-        let mut tags = if page_header.available_page_tag > 1 {
-            Vec::with_capacity(page_header.available_page_tag as usize)
-        }else {
+        let tags = if !page_header.is_empty_flag() && (page_header.available_page_tag > 1 && data.len() > page_header.available_page_tag as usize) {
+            let mut tags = Vec::with_capacity(page_header.available_page_tag as usize);
+            let tag_reader = TagReader::new(header.page_size, header.file_format_revision);
+            for tag_n in 0..page_header.available_page_tag {
+                let tag_offset_rel = (tag_n as usize + 1) * 4;
+                if tag_offset_rel > page_size {
+                    break
+                }
+                let tag_offset = page_size - tag_offset_rel;
+                if tag_offset + 4 > data.len() {
+                    break
+                }
+                let tag_data = &data[tag_offset..tag_offset + 4];
+                let tag = match tag_reader.from_buff(&tag_data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        break
+                    }
+                };
+                if tag.value_offset as usize + tag.value_size as usize > data.len() {
+                    break
+                }
+                tags.push(tag);
+            }
+            tags
+        } else {
             Vec::new()
         };
-        for tag_n in 0..page_header.available_page_tag {
-            let tag_offset = page_size - ((tag_n as usize + 1) * 4);
-            let tag_data = &data[tag_offset..tag_offset + 4];
-            let tag = match Tag::from_buff(&tag_data, header.file_format_revision) {
-                Ok(v) => v,
-                Err(e) => return Err(ForensicError::bad_format_string(format!("Cannot parse Tag {tag_n} for page {page_number}: {}", e)))
-            };
-            tags.push(tag);
-        }
+        
         Ok(Self {
             header : page_header,
             tags,
@@ -285,13 +371,29 @@ impl Page {
             None => return Err(ForensicError::missing_str("Cannot find tag"))
         };
         let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
-        println!("Offset: {:#0x} tag_offset={:#0x} header_size={:#0x}", tag_offset, tag.value_offset, self.header.header_size);
         let tag_end = tag_offset + tag.value_size as usize;
         if tag_end > self.data.len() {
+            println!("tag_end={:#0x}", tag_end);
+            println!("tag_offset={:#0x}", tag_offset);
             return Err(ForensicError::missing_str("Tag size out of bounds"))
         }
         let data = &self.data[tag_offset..tag_end];
         Ok(data)
+    }
+    pub fn get_tag(&self, tag_n : usize) -> ForensicResult<(&Tag, &[u8])> {
+        let tag = match self.tags.get(tag_n) {
+            Some(v) => v,
+            None => return Err(ForensicError::missing_str("Cannot find tag"))
+        };
+        let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
+        let tag_end = tag_offset + tag.value_size as usize;
+        if tag_end > self.data.len() {
+            println!("tag_end={:#0x}", tag_end);
+            println!("tag_offset={:#0x}", tag_offset);
+            return Err(ForensicError::missing_str("Tag size out of bounds"))
+        }
+        let data = &self.data[tag_offset..tag_end];
+        Ok((tag, data))
     }
 
     pub fn is_root(&self) -> bool {
@@ -303,29 +405,58 @@ impl Page {
     pub fn is_leaf(&self) -> bool {
         self.header.is_leaf()
     }
+    pub fn is_index(&self) -> bool {
+        self.header.is_index()
+    }
+    pub fn is_space_tree(&self) -> bool {
+        self.header.is_space_tree()
+    }
+    pub fn empty_page(&self) -> bool {
+        self.header.is_empty_flag()
+    }
 
-    pub fn get_tree_header(&self) -> ForensicResult<TreePageHeader> {
-        let tag_data = self.get_tag_data(0)?;
-        if self.is_root() {
-            let root_header = RootHeader::new(tag_data, self.header.revision)?;
-            return Ok(TreePageHeader::Root(root_header));
-        }else if self.is_branch() {
-            let branch_header = BranchHeader::new(tag_data, self.header.revision)?;
-            return Ok(TreePageHeader::Branch(branch_header))
+    pub fn process_page<'a>(&'a self) -> ForensicResult<TreePage<'a>> {
+        if self.is_branch() {
+            return Ok(TreePage::Branch(BranchPage::new(&self)?))
+        }else if self.is_leaf() {
+            return Ok(TreePage::Leaf(LeafPage::new(&self)?))
+        }else if self.is_root() {
+            return Ok(TreePage::Root(RootPage::new(&self)?))
         }
         Err(ForensicError::bad_format_str("No external header"))
     }
 
     pub fn get_page_keys_if_root<'a>(&'a self, key_n : usize) -> ForensicResult<PageKeyRef<'a>> {
-        let tag_data = self.get_tag_data(key_n + 1)?;
+        let tag_data: &[u8] = self.get_tag_data(key_n + 1)?;
         PageKeyRef::new(tag_data)
+    }
+    pub fn valid_page(&self) -> bool {
+        if self.header.page_flags >= 0x340032 {
+            return false
+        }
+        if self.header.available_data_size as usize > self.data.len() {
+            return false
+        }
+        if self.header.available_data_offset as usize > self.data.len() {
+            return false
+        }
+        if self.header.available_page_tag as usize > self.data.len() {
+            return false
+        }
+        if self.header.available_uncommited_data_size > self.header.available_data_size {
+            return false
+        }
+        if self.header.is_erased() || self.header.is_repaired() {
+            return false
+        }
+        true
     }
 }
 
 #[cfg(test)]
 mod tst {
 
-    use crate::ese::{header::{FileFormatFingerprint, Header, DATABASE_CLEAN_SHUTDOWN}, page::PageChecksumWin7, tag::Tag, tst::get_mdb_and_header};
+    use crate::ese::{header::{FileFormatFingerprint, Header, DATABASE_CLEAN_SHUTDOWN}, page::PageChecksumWin7, tag::Tag, tst::{get_mdb_and_header, get_mdb_and_header_ual, open_debug_file, to_debug_file}};
 
     use super::{Page, PageHeader};
 
@@ -360,28 +491,41 @@ mod tst {
 
     #[test]
     fn should_load_full_page() {
-        let (buffer, header) = get_mdb_and_header();
-        println!("{:?}", header);
+        let (buffer, header) = get_mdb_and_header_ual();
+        let mut dbg = open_debug_file("ual-test");
+        to_debug_file(&mut dbg, " HEADER ",format!("{:#?}", header));
         let page_n = 4u32;
         let page_offset = header.page_to_file_offset(page_n as u64) as usize;
         let page = Page::new(buffer[page_offset..page_offset + header.page_size as usize].to_vec(), page_n, &header).unwrap();
         assert_eq!(&[Tag { value_offset: 0, tag_flags: 0, value_size: 16 }, Tag { value_offset: 2775, tag_flags: 0, value_size: 19 }, Tag { value_size: 14, tag_flags: 0, value_offset: 2794 }, Tag { value_size: 6, tag_flags: 0, value_offset: 2769 }], &page.tags[..]);
 
-        let page_n = 4u32;
-        let page_offset = header.page_to_file_offset(page_n as u64) as usize;
-        let page = Page::new(buffer[page_offset..page_offset + header.page_size as usize].to_vec(), page_n, &header).unwrap();
-        println!("{:?}", page.tags);
-        println!("Page_offse={}", page_offset);
-        for i in 0..page.tags.len() {
-            let data = page.get_tag_data(i).unwrap();
-            println!("{:?}", data);
-            println!("{}", String::from_utf8_lossy(data));
-            println!("4 last bytes={}", u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().unwrap_or_default()));
-            if i > 0 {
-                println!("{:?}", page.get_page_keys_if_root(i - 1).unwrap());
+        for page_n in 4u32..254 {
+            let page_offset = header.page_to_file_offset(page_n as u64) as usize;
+            let page = Page::new(buffer[page_offset..page_offset + header.page_size as usize].to_vec(), page_n, &header).unwrap();
+            to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", page));
+            to_debug_file(&mut dbg, &format!("Page {page_n} Flags"),format!("{:#?}", page.header.flags()));
+            if page.tags.is_empty() {
+                continue;
             }
+            if !page.valid_page() {
+                println!("Invalid page {page_n}");
+                continue
+            }
+            if page.empty_page() {
+                continue
+            }
+            for i in 0..page.tags.len() {
+                let data = match page.get_tag_data(i) {
+                    Ok(v) => v,
+                    Err(e) => panic!("{e}")
+                };
+                //to_debug_file(&mut dbg, &format!("Page {page_n} tag {i} Data"),format!("{:#?}", data));
+                //to_debug_file(&mut dbg, &format!("Page {page_n}  tag {i} Data as STR"),format!("{}", String::from_utf8_lossy(data)));
+                //println!("4 last bytes={}", u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().unwrap_or_default()));
+            }
+            let ext_header = page.process_page().unwrap();
+            println!("{:?}", ext_header);
         }
-        let ext_header = page.get_tree_header().unwrap();
-        println!("{:?}", ext_header);
+        
     }
 }

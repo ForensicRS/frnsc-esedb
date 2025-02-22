@@ -1,4 +1,19 @@
-use forensic_rs::err::{ForensicError, ForensicResult};
+use forensic_rs::{err::{ForensicError, ForensicResult}, prelude::NotificationType};
+
+use super::{branch::BranchPageEntry, leaf::LeafPageEntry, Page};
+
+
+#[derive(Clone, Debug)]
+pub struct RootPage <'a>{
+    pub header : RootHeader,
+    pub entries : Vec<RootEntry<'a>>
+}
+
+#[derive(Clone, Debug)]
+pub enum RootEntry<'a> {
+    Branch(BranchPageEntry<'a>),
+    Leaf(LeafPageEntry<'a>)
+}
 
 #[derive(Clone, Debug)]
 pub struct RootHeader {
@@ -10,8 +25,9 @@ pub struct RootHeader {
 }
 
 impl RootHeader {
-    pub fn new(data : &[u8], revision : u32) -> ForensicResult<Self> {
-        let (header_size, mut offset) = if revision >= 0x14 && data.len() == 25 {
+    pub fn new(page: &Page) -> ForensicResult<Self> {
+        let data = page.get_tag_data(0)?;
+        let (header_size, mut offset) = if page.header.revision >= 0x14 && data.len() == 25 {
             (25, 1)
         }else if data.len() == 16{
             (16, 0)
@@ -34,6 +50,25 @@ impl RootHeader {
             parent_father_data_page,
             extent_space,
             space_tree_page_number
+        })
+    }
+}
+
+
+impl<'a> RootPage<'a> {
+    pub fn new(page: &'a Page) -> ForensicResult<RootPage<'a>> {
+        let entries = if page.tags.len() > 1 {
+            if page.is_leaf() {
+                LeafPageEntry::leaf_entries(page)?.into_iter().map(|v| RootEntry::Leaf(v)).collect()
+            }else {
+                BranchPageEntry::branch_entries(page)?.into_iter().map(|v| RootEntry::Branch(v)).collect()
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(RootPage {
+            header: RootHeader::new(page)?,
+            entries,
         })
     }
 }
