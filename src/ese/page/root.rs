@@ -1,4 +1,4 @@
-use forensic_rs::{err::{ForensicError, ForensicResult}, prelude::NotificationType};
+use forensic_rs::err::{ForensicError, ForensicResult};
 
 use super::{branch::BranchPageEntry, leaf::LeafPageEntry, Page};
 
@@ -25,7 +25,7 @@ pub struct RootHeader {
 }
 
 impl RootHeader {
-    pub fn new(page: &Page) -> ForensicResult<Self> {
+    pub fn new(page: &Page<'_>) -> ForensicResult<Self> {
         let data = page.get_tag_data(0)?;
         let (header_size, mut offset) = if page.header.revision >= 0x14 && data.len() == 25 {
             (25, 1)
@@ -56,12 +56,12 @@ impl RootHeader {
 
 
 impl<'a> RootPage<'a> {
-    pub fn new(page: &'a Page) -> ForensicResult<RootPage<'a>> {
+    pub fn new(page: &'a Page<'_>) -> ForensicResult<RootPage<'a>> {
         let entries = if page.tags.len() > 1 {
             if page.is_leaf() {
-                LeafPageEntry::leaf_entries(page)?.into_iter().map(|v| RootEntry::Leaf(v)).collect()
+                LeafPageEntry::leaf_entries(page)?.into_iter().map(RootEntry::Leaf).collect()
             }else {
-                BranchPageEntry::branch_entries(page)?.into_iter().map(|v| RootEntry::Branch(v)).collect()
+                BranchPageEntry::branch_entries(page)?.into_iter().map(RootEntry::Branch).collect()
             }
         } else {
             Vec::new()

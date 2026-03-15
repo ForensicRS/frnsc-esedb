@@ -1,4 +1,4 @@
-use forensic_rs::err::{ForensicError, ForensicResult};
+use forensic_rs::err::ForensicResult;
 
 #[derive(Clone, Debug)]
 pub struct IndexEntry<'a> {

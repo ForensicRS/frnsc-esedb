@@ -10,5 +10,5 @@ pub enum PageEntry<'a> {
     Index(IndexEntry<'a>),
     LongValue(long_value::LongValueEntry<'a>),
     SpaceTree(space_tree::SpaceTreeEntry<'a>),
-    TableValue
+    TableValue(table_value::TableValueEntry<'a>)
 }

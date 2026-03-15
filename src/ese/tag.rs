@@ -27,6 +27,12 @@ pub struct Tag {
     pub value_size : u16
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TagData <'a> {
+    pub data : &'a [u8],
+    pub flags : u8,
+}
+
 impl Tag {
     pub fn from_buff(buffer : &[u8], revision : u32, page_size : u32) -> ForensicResult<Self> {
         if buffer.len() < 4 {

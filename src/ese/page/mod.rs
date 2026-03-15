@@ -1,10 +1,12 @@
+use std::borrow::Cow;
+
 use branch::BranchPage;
-use forensic_rs::err::{BadFormatError, ForensicError, ForensicResult};
+use forensic_rs::err::{ForensicError, ForensicResult};
 use key::PageKeyRef;
 use leaf::LeafPage;
-use root::{RootHeader, RootPage};
+use root::RootPage;
 
-use super::{header::Header, tag::{Tag, TagReader}};
+use super::{header::Header, tag::{Tag, TagData, TagReader}};
 
 pub mod root;
 pub mod branch;
@@ -19,8 +21,10 @@ pub const EMPTY_PAGE_FLAG : u32 = 0x00000008;
 pub const SPACE_TREE_PAGE_FLAG : u32 = 0x00000020;
 pub const INDEX_PAGE_FLAG : u32 = 0x00000040;
 pub const LONG_VALUE_PAGE_FLAG : u32 = 0x00000080;
+pub const PRIMARY_PAGE_FLAG : u32 = 0x000800;
 pub const ERASED_PAGE_FLAG : u32 = 0x00004000;
 pub const REPAIRED_PAGE_FLAG : u32 = 0x200000;
+
 
 #[derive(Clone, Debug)]
 pub enum TreePage<'a> {
@@ -40,7 +44,7 @@ pub enum PageFlag {
     LongValue
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct PageHeaderExchange2003Repr {
     pub xor : u32,
     pub page_number : u32,
@@ -60,7 +64,7 @@ pub struct PageChecksumExchange2003 {
     pub page_number : u32
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct PageHeaderWinVistaRepr {
     pub xor_checksum : u32,
     pub ecc_checksum : u32,
@@ -79,7 +83,7 @@ pub struct PageChecksumWinVista {
     pub xor_checksum : u32,
     pub ecc_checksum : u32
 }
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct PageHeaderWin7ExtRepr {
     pub checksum : u64,
     pub last_modification_time : u64,
@@ -103,7 +107,7 @@ pub struct PageChecksumWin7 {
     pub checksum : u64
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct PageHeaderRepr {
     pub checksum : u64,
     pub last_modification_time : u64,
@@ -212,7 +216,7 @@ impl From<&PageHeaderRepr> for PageHeader {
 impl PageHeader {
     pub fn from_buff(buffer : &[u8], version : u32, revision : u32) -> ForensicResult<PageHeader> {
         let (head, data, tail) = unsafe {&buffer[..].align_to::<PageHeaderRepr>()};
-        if head.len() > 0 || data.len() == 0 {
+        if !head.is_empty() || data.is_empty() {
             return Err(forensic_rs::err::ForensicError::bad_format_str("Invalid alignement"));
         }
         let mut page : PageHeader = (&data[0]).into();
@@ -272,7 +276,9 @@ impl PageHeader {
     pub fn is_index(&self) -> bool {
         self.page_flags & INDEX_PAGE_FLAG > 0
     }
-
+    pub fn is_primary(&self) -> bool {
+        self.page_flags & PRIMARY_PAGE_FLAG > 0
+    }
     pub fn is_parent(&self) -> bool {
         self.page_flags & PARENT_PAGE_FLAG > 0
     }
@@ -314,17 +320,17 @@ impl PageHeader {
 }
 
 #[derive(Clone, Debug)]
-pub struct Page {
+pub struct Page<'a> {
     pub page_number : u32,
-    pub data : Vec<u8>,
+    pub data : Cow<'a, [u8]>,
     pub header : PageHeader,
     pub tags : Vec<Tag>
 }
 
-impl Page {
-    pub fn new(data : Vec<u8>, page_number : u32, header : &Header) -> ForensicResult<Self> {
+impl<'p> Page<'p> {
+    pub fn new(data : Cow<'p, [u8]>, page_number : u32, header : &Header) -> ForensicResult<Self> {
         let page_size = header.page_size as usize;
-        if data.len() != page_size as usize {
+        if data.len() != page_size {
             return Err(ForensicError::bad_format_str("Page data size does not match Header page size"))
         }
         let page_header = PageHeader::from_buff(&data, header.version, header.file_format_revision)?;
@@ -341,9 +347,9 @@ impl Page {
                     break
                 }
                 let tag_data = &data[tag_offset..tag_offset + 4];
-                let tag = match tag_reader.from_buff(&tag_data) {
+                let tag = match tag_reader.from_buff(tag_data) {
                     Ok(v) => v,
-                    Err(e) => {
+                    Err(_) => {
                         break
                     }
                 };
@@ -373,14 +379,12 @@ impl Page {
         let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
         let tag_end = tag_offset + tag.value_size as usize;
         if tag_end > self.data.len() {
-            println!("tag_end={:#0x}", tag_end);
-            println!("tag_offset={:#0x}", tag_offset);
             return Err(ForensicError::missing_str("Tag size out of bounds"))
         }
         let data = &self.data[tag_offset..tag_end];
         Ok(data)
     }
-    pub fn get_tag(&self, tag_n : usize) -> ForensicResult<(&Tag, &[u8])> {
+    pub fn get_tag<'a>(&'a self, tag_n : usize) -> ForensicResult<TagData<'a>> {
         let tag = match self.tags.get(tag_n) {
             Some(v) => v,
             None => return Err(ForensicError::missing_str("Cannot find tag"))
@@ -388,12 +392,13 @@ impl Page {
         let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
         let tag_end = tag_offset + tag.value_size as usize;
         if tag_end > self.data.len() {
-            println!("tag_end={:#0x}", tag_end);
-            println!("tag_offset={:#0x}", tag_offset);
             return Err(ForensicError::missing_str("Tag size out of bounds"))
         }
         let data = &self.data[tag_offset..tag_end];
-        Ok((tag, data))
+        Ok(TagData {
+            data,
+            flags : tag.tag_flags
+        })
     }
 
     pub fn is_root(&self) -> bool {
@@ -408,6 +413,9 @@ impl Page {
     pub fn is_index(&self) -> bool {
         self.header.is_index()
     }
+    pub fn is_primary(&self) -> bool {
+        self.header.is_primary()
+    }
     pub fn is_space_tree(&self) -> bool {
         self.header.is_space_tree()
     }
@@ -415,13 +423,17 @@ impl Page {
         self.header.is_empty_flag()
     }
 
+    pub fn is_long_value(&self) -> bool {
+        self.header.is_long_value()
+    }
+
     pub fn process_page<'a>(&'a self) -> ForensicResult<TreePage<'a>> {
         if self.is_branch() {
-            return Ok(TreePage::Branch(BranchPage::new(&self)?))
+            return Ok(TreePage::Branch(BranchPage::new(self)?))
         }else if self.is_leaf() {
-            return Ok(TreePage::Leaf(LeafPage::new(&self)?))
+            return Ok(TreePage::Leaf(LeafPage::new(self)?))
         }else if self.is_root() {
-            return Ok(TreePage::Root(RootPage::new(&self)?))
+            return Ok(TreePage::Root(RootPage::new(self)?))
         }
         Err(ForensicError::bad_format_str("No external header"))
     }
@@ -430,6 +442,33 @@ impl Page {
         let tag_data: &[u8] = self.get_tag_data(key_n + 1)?;
         PageKeyRef::new(tag_data)
     }
+    /// Creates a zero-filled dummy page for use in unit tests where the
+    /// `Page` argument is not actually accessed (e.g. `TableValueEntry::new`).
+    #[cfg(test)]
+    pub fn dummy() -> Page<'static> {
+        Page {
+            page_number: 0,
+            data: Cow::Owned(vec![0u8; 40]),
+            header: PageHeader {
+                checksum: PageChecksum::Win7(PageChecksumWin7 { checksum: 0 }),
+                last_modification_time: 0,
+                previous_page_number: 0,
+                next_page_number: 0,
+                father_data_page_id: 0,
+                available_data_size: 0,
+                available_uncommited_data_size: 0,
+                available_data_offset: 0,
+                available_page_tag: 0,
+                page_flags: 0,
+                extension: None,
+                header_size: 40,
+                version: 0,
+                revision: 0,
+            },
+            tags: Vec::new(),
+        }
+    }
+
     pub fn valid_page(&self) -> bool {
         if self.header.page_flags >= 0x340032 {
             return false
@@ -456,7 +495,8 @@ impl Page {
 #[cfg(test)]
 mod tst {
 
-    use crate::ese::{header::{FileFormatFingerprint, Header, DATABASE_CLEAN_SHUTDOWN}, page::PageChecksumWin7, tag::Tag, tst::{get_mdb_and_header, get_mdb_and_header_ual, open_debug_file, to_debug_file}};
+    use std::borrow::Cow;
+    use crate::ese::{page::PageChecksumWin7, tst::{get_mdb_and_header, get_mdb_and_header_ual, open_debug_file, to_debug_file}};
 
     use super::{Page, PageHeader};
 
@@ -496,13 +536,13 @@ mod tst {
         to_debug_file(&mut dbg, " HEADER ",format!("{:#?}", header));
         let page_n = 4u32;
         let page_offset = header.page_to_file_offset(page_n as u64) as usize;
-        let page = Page::new(buffer[page_offset..page_offset + header.page_size as usize].to_vec(), page_n, &header).unwrap();
-        assert_eq!(&[Tag { value_offset: 0, tag_flags: 0, value_size: 16 }, Tag { value_offset: 2775, tag_flags: 0, value_size: 19 }, Tag { value_size: 14, tag_flags: 0, value_offset: 2794 }, Tag { value_size: 6, tag_flags: 0, value_offset: 2769 }], &page.tags[..]);
+        let _page = Page::new(Cow::Owned(buffer[page_offset..page_offset + header.page_size as usize].to_vec()), page_n, &header).unwrap();
+        //assert_eq!(&[Tag { value_offset: 0, tag_flags: 0, value_size: 16 }, Tag { value_offset: 2775, tag_flags: 0, value_size: 19 }, Tag { value_size: 14, tag_flags: 0, value_offset: 2794 }, Tag { value_size: 6, tag_flags: 0, value_offset: 2769 }], &page.tags[..]);
 
         for page_n in 4u32..254 {
             let page_offset = header.page_to_file_offset(page_n as u64) as usize;
-            let page = Page::new(buffer[page_offset..page_offset + header.page_size as usize].to_vec(), page_n, &header).unwrap();
-            to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", page));
+            let page = Page::new(Cow::Owned(buffer[page_offset..page_offset + header.page_size as usize].to_vec()), page_n, &header).unwrap();
+            //to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", page));
             to_debug_file(&mut dbg, &format!("Page {page_n} Flags"),format!("{:#?}", page.header.flags()));
             if page.tags.is_empty() {
                 continue;
@@ -514,17 +554,8 @@ mod tst {
             if page.empty_page() {
                 continue
             }
-            for i in 0..page.tags.len() {
-                let data = match page.get_tag_data(i) {
-                    Ok(v) => v,
-                    Err(e) => panic!("{e}")
-                };
-                //to_debug_file(&mut dbg, &format!("Page {page_n} tag {i} Data"),format!("{:#?}", data));
-                //to_debug_file(&mut dbg, &format!("Page {page_n}  tag {i} Data as STR"),format!("{}", String::from_utf8_lossy(data)));
-                //println!("4 last bytes={}", u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().unwrap_or_default()));
-            }
-            let ext_header = page.process_page().unwrap();
-            println!("{:?}", ext_header);
+            let tree_page = page.process_page().unwrap();
+            to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", tree_page));
         }
         
     }

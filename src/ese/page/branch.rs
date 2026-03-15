@@ -54,7 +54,7 @@ impl<'a> BranchPageEntry<'a> {
         })
     }
 
-    pub fn branch_entries(page: &'a Page) -> ForensicResult<Vec<BranchPageEntry<'a>>> {
+    pub fn branch_entries(page: &'a Page<'_>) -> ForensicResult<Vec<BranchPageEntry<'a>>> {
         Ok(if page.tags.len() > 1 {
             let mut entries = Vec::with_capacity(page.tags.len().wrapping_rem(1));
             for i in 1..page.tags.len() {
@@ -90,11 +90,11 @@ impl<'a> BranchPageEntry<'a> {
 }
 
 impl<'a> BranchPage<'a> {
-    pub fn new(page: &'a Page) -> ForensicResult<BranchPage<'a>> {
+    pub fn new(page: &'a Page<'_>) -> ForensicResult<BranchPage<'a>> {
         let tag_0 = page.get_tag_data(0)?;
         Ok(Self {
             header: BranchPageHeader::new(tag_0),
-            entries : BranchPageEntry::branch_entries(&page)?,
+            entries: BranchPageEntry::branch_entries(page)?,
         })
     }
 }

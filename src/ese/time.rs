@@ -33,7 +33,7 @@ impl TryFrom<LogTime> for Filetime {
             [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][month as usize]
         };
         let days_years = to_days_since_begining(year);
-        let total = (((days_years + acumulated_day_month + days as u64) * 24 + hours as u64) * 3600 + minutes as u64 * 60 + seconds as u64) * 1000 * 1000 * 10;
+        let total = (((days_years + acumulated_day_month + days) * 24 + hours as u64) * 3600 + minutes as u64 * 60 + seconds as u64) * 1000 * 1000 * 10;
         Ok(Self::new(total))
     }
     
@@ -41,7 +41,7 @@ impl TryFrom<LogTime> for Filetime {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 100 == 0 && year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn to_days_since_begining(year : u64) -> u64 {

@@ -14,7 +14,7 @@ pub fn get_mdb_and_header() -> (Vec<u8>, Header) {
 }
 
 pub fn get_mdb_and_header_ual() -> (Vec<u8>, Header) {
-    let db: Vec<u8> = std::fs::read("./artifacts/UAL/UAL/SystemIdentity.mdb").unwrap();
+    let db: Vec<u8> = std::fs::read("./artifacts/UAL/UAL/Current.mdb").unwrap();
     let header = Header::from_buff(&db).unwrap();
     (db, header)
 }

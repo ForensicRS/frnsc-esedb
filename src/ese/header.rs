@@ -1,4 +1,4 @@
-use forensic_rs::{err::{ForensicError, ForensicResult}, utils::time::{Filetime, WinFiletime}};
+use forensic_rs::{err::{ForensicError, ForensicResult}, utils::time::Filetime};
 
 use super::time::LogTime;
 
@@ -48,7 +48,7 @@ pub enum FileFormatFingerprint {
     
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct HeaderRpr {
     pub checksum : u32,
     pub file_signature : u32,
@@ -214,7 +214,7 @@ impl TryFrom<&HeaderRpr> for Header {
 impl Header {
     pub fn from_buff(buffer : &[u8]) -> ForensicResult<Header> {
         let (head, data, _tail) = unsafe {&buffer[..].align_to::<HeaderRpr>()};
-        if head.len() > 0 || data.len() == 0 {
+        if !head.is_empty() || data.is_empty() {
             return Err(forensic_rs::err::ForensicError::bad_format_str("Invalid alignement"));
         }
         let header : Header = (&data[0]).try_into()?;
