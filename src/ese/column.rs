@@ -1,5 +1,6 @@
 use std::fmt;
-use forensic_rs::utils::time::Filetime;
+use forensic_rs::traits::db::ForensicColumnType;
+use forensic_rs::utils::time::ForensicTimestamp;
 
 /// ESE column type identifiers as defined in the JET API specification.
 #[repr(u8)]
@@ -71,6 +72,33 @@ impl ColumnType {
             _    => None,
         }
     }
+
+    /// Map to `forensic_rs`'s column-type vocabulary.
+    ///
+    /// A fidelity upgrade over the pre-0.14 SQL bridge, which flattened
+    /// `DateTime` and `GUID` into `Binary`: `ForensicColumnType` carries both
+    /// natively.
+    pub fn forensic_type(self) -> ForensicColumnType {
+        match self {
+            ColumnType::Nil           => ForensicColumnType::Null,
+            ColumnType::Bit           => ForensicColumnType::Bool,
+            ColumnType::UnsignedByte  => ForensicColumnType::U8,
+            ColumnType::Short         => ForensicColumnType::I16,
+            ColumnType::Long          => ForensicColumnType::I32,
+            ColumnType::Currency      => ForensicColumnType::I64,
+            ColumnType::IEEESingle    => ForensicColumnType::F32,
+            ColumnType::IEEEDouble    => ForensicColumnType::F64,
+            ColumnType::DateTime      => ForensicColumnType::DateTime,
+            ColumnType::Binary        => ForensicColumnType::Binary,
+            ColumnType::Text          => ForensicColumnType::Text,
+            ColumnType::LongBinary    => ForensicColumnType::Binary,
+            ColumnType::LongText      => ForensicColumnType::Text,
+            ColumnType::UnsignedLong  => ForensicColumnType::U32,
+            ColumnType::LongLong      => ForensicColumnType::I64,
+            ColumnType::GUID          => ForensicColumnType::Guid,
+            ColumnType::UnsignedShort => ForensicColumnType::U16,
+        }
+    }
 }
 
 /// A typed column value decoded from an ESE data record.
@@ -84,7 +112,7 @@ pub enum ColumnValue<'a> {
     Currency(i64),
     IEEESingle(f32),
     IEEEDouble(f64),
-    DateTime(Filetime),
+    DateTime(ForensicTimestamp),
     /// Variable-length binary data stored inline (≤255 bytes).
     Binary(&'a [u8]),
     /// Variable-length text stored inline (≤255 bytes), raw bytes (encoding
@@ -112,7 +140,20 @@ impl<'a> ColumnValue<'a> {
             ColumnType::Currency      => data.get(..8).map(|b| ColumnValue::Currency(i64::from_le_bytes(b.try_into().unwrap()))),
             ColumnType::IEEESingle    => data.get(..4).map(|b| ColumnValue::IEEESingle(f32::from_le_bytes(b.try_into().unwrap()))),
             ColumnType::IEEEDouble    => data.get(..8).map(|b| ColumnValue::IEEEDouble(f64::from_le_bytes(b.try_into().unwrap()))),
-            ColumnType::DateTime      => data.get(..8).map(|b| ColumnValue::DateTime(Filetime::new(u64::from_le_bytes(b.try_into().unwrap())))),
+            // JET_coltypDateTime stores an 8-byte IEEE-754 double: an OLE
+            // Automation date (days since 1899-12-30, per the JET/ESE
+            // specification) — *not* a raw Win32 FILETIME integer. Verified
+            // against `artifacts/sru/SRUDB.dat`: reinterpreting a real
+            // AppResourceUsage.TimeStamp value's bit pattern as f64 yields
+            // ~44117.84 (≈ 2020-10-29), matching the fixture's known era;
+            // reading the same bytes as a raw FILETIME u64 (the pre-existing,
+            // and until now unnoticed, decoder bug) yields year 16419. An
+            // out-of-range double degrades to `None` (column reads as absent)
+            // rather than fabricating an epoch substitute.
+            ColumnType::DateTime      => data.get(..8).and_then(|b| {
+                let ole_date = f64::from_le_bytes(b.try_into().unwrap());
+                ForensicTimestamp::try_from_ole_date(ole_date).ok()
+            }).map(ColumnValue::DateTime),
             ColumnType::UnsignedLong  => data.get(..4).map(|b| ColumnValue::UnsignedLong(u32::from_le_bytes(b.try_into().unwrap()))),
             ColumnType::LongLong      => data.get(..8).map(|b| ColumnValue::LongLong(i64::from_le_bytes(b.try_into().unwrap()))),
             ColumnType::GUID          => data.get(..16).map(|b| {
@@ -148,7 +189,7 @@ impl fmt::Display for ColumnValue<'_> {
             ColumnValue::Currency(v)   => write!(f, "{v}"),
             ColumnValue::IEEESingle(v) => write!(f, "{v}"),
             ColumnValue::IEEEDouble(v) => write!(f, "{v}"),
-            ColumnValue::DateTime(v)   => write!(f, "{v:?}"),
+            ColumnValue::DateTime(v)   => write!(f, "{v}"),
             ColumnValue::UnsignedLong(v)  => write!(f, "{v}"),
             ColumnValue::LongLong(v)   => write!(f, "{v}"),
             ColumnValue::UnsignedShort(v) => write!(f, "{v}"),
@@ -346,7 +387,7 @@ pub enum OwnedColumnValue {
     Currency(i64),
     IEEESingle(f32),
     IEEEDouble(f64),
-    DateTime(Filetime),
+    DateTime(ForensicTimestamp),
     Binary(Vec<u8>),
     /// Raw text bytes; use `Display` for a decoded string.
     Text(Vec<u8>),
@@ -447,8 +488,8 @@ impl OwnedColumnValue {
         }
     }
 
-    /// Return the `Filetime` from a `DateTime` column.
-    pub fn as_datetime(&self) -> Option<Filetime> {
+    /// Return the `ForensicTimestamp` from a `DateTime` column.
+    pub fn as_datetime(&self) -> Option<ForensicTimestamp> {
         match self {
             OwnedColumnValue::DateTime(v) => Some(*v),
             _ => None,
@@ -475,7 +516,7 @@ impl fmt::Display for OwnedColumnValue {
             OwnedColumnValue::Currency(v)      => write!(f, "{v}"),
             OwnedColumnValue::IEEESingle(v)    => write!(f, "{v}"),
             OwnedColumnValue::IEEEDouble(v)    => write!(f, "{v}"),
-            OwnedColumnValue::DateTime(v)      => write!(f, "{v:?}"),
+            OwnedColumnValue::DateTime(v)      => write!(f, "{v}"),
             OwnedColumnValue::UnsignedLong(v)  => write!(f, "{v}"),
             OwnedColumnValue::LongLong(v)      => write!(f, "{v}"),
             OwnedColumnValue::UnsignedShort(v) => write!(f, "{v}"),
@@ -506,7 +547,7 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
 }
 
 fn is_likely_utf16le(bytes: &[u8]) -> bool {
-    if bytes.len() < 4 || bytes.len() % 2 != 0 {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
         return false;
     }
     let zero_second = bytes.chunks_exact(2).filter(|c| c[1] == 0).count();
@@ -591,5 +632,34 @@ mod tst {
         }
         assert!(ColumnType::from_u8(0x0d).is_none()); // SLV reserved
         assert!(ColumnType::from_u8(0xff).is_none());
+    }
+
+    #[test]
+    fn datetime_column_decodes_as_ole_automation_date_not_filetime() {
+        // Real bytes from `artifacts/sru/SRUDB.dat`'s AppResourceUsage
+        // TimeStamp column (verified against the fixture directly): the
+        // raw 8 bytes, read as an OLE Automation date (the JET/ESE
+        // JET_coltypDateTime encoding), decode to 2020-10-13 — plausible
+        // for this fixture's known era. Reading the same bytes as a raw
+        // Win32 FILETIME integer (the pre-existing bug) produced year 16419.
+        let raw: u64 = 4676296323666758133;
+        let bytes = raw.to_le_bytes();
+        let value = super::ColumnValue::from_fixed(ColumnType::DateTime, &bytes)
+            .expect("DateTime column should decode");
+        let super::ColumnValue::DateTime(ts) = value else {
+            panic!("expected DateTime variant");
+        };
+        assert_eq!(2020, ts.year());
+        assert_eq!(10, ts.month());
+        assert_eq!(13, ts.day());
+    }
+
+    #[test]
+    fn datetime_column_rejects_out_of_range_ole_date() {
+        // A bit pattern whose f64 interpretation is out of Timestamp128's
+        // representable range must degrade to `None`, not fabricate a
+        // clamped/epoch timestamp.
+        let bytes = f64::MAX.to_le_bytes();
+        assert!(super::ColumnValue::from_fixed(ColumnType::DateTime, &bytes).is_none());
     }
 }

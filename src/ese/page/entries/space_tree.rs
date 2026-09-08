@@ -1,6 +1,6 @@
 use forensic_rs::err::{ForensicError, ForensicResult};
 
-use crate::ese::tag::TagData;
+use crate::ese::tag::{TagData, TAG_COMMON_KEY};
 
 #[derive(Clone, Debug)]
 pub struct SpaceTreeEntry<'a> {
@@ -15,16 +15,16 @@ impl<'a> SpaceTreeEntry<'a> {
     pub fn new(tag : TagData<'a>) -> ForensicResult<SpaceTreeEntry<'a>> {
         let (tag_flags, data) = (tag.flags, tag.data);
         if data.len() < 8 {
-            return Err(ForensicError::bad_format_str("Space Tree size must be bigger than 8 bytes"))
+            return Err(ForensicError::invalid_format("ESE", "Space Tree size must be bigger than 8 bytes"))
         }
-        let common_page_key_size = if tag_flags == 0x4 {
+        let common_page_key_size = if tag_flags & TAG_COMMON_KEY != 0 {
             u16::from_le_bytes([data[0], data[1]])
         }else {
             0
         };
         let local_page_key_size = u16::from_le_bytes([data[2], data[3]]);
         if data.len() < 8 + local_page_key_size as usize {
-            return Err(ForensicError::bad_format_str("Space Tree size must be bigger than local_page_key_size + 8 bytes"))
+            return Err(ForensicError::invalid_format("ESE", "Space Tree size must be bigger than local_page_key_size + 8 bytes"))
         }
         let page_key = &data[4..4 + local_page_key_size as usize];
         let entry_data = &data[4 + local_page_key_size as usize..data.len() - 4];

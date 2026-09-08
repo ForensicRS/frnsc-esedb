@@ -68,7 +68,7 @@ impl<'a> TableValueEntry<'a> {
     pub fn new(_page: &'a Page<'_>, tag: TagData<'a>) -> ForensicResult<TableValueEntry<'a>> {
         let data = tag.data;
         if data.len() < 4 {
-            return Err(ForensicError::bad_format_str(
+            return Err(ForensicError::invalid_format("ESE", 
                 "TableValueEntry must be at least 4 bytes",
             ));
         }
@@ -95,7 +95,7 @@ impl<'a> TableValueEntry<'a> {
         let var_offsets_start = variable_data_offset.saturating_sub(num_var * 2);
 
         if variable_data_offset > data.len() {
-            return Err(ForensicError::bad_format_str(
+            return Err(ForensicError::invalid_format("ESE", 
                 "TableValueEntry: variable_data_offset exceeds record length",
             ));
         }

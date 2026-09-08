@@ -9,7 +9,7 @@
 //! for name in db.table_names() {
 //!     println!("{name}");
 //! }
-//! if let Some(table) = db.table("CLIENTS") {
+//! if let Ok(table) = db.table("CLIENTS") {
 //!     for row in table.iter_rows() {
 //!         if let Some(v) = row.get("Address") {
 //!             println!("{v}");
@@ -20,24 +20,36 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use forensic_rs::err::{ForensicError, ForensicResult};
-use forensic_rs::utils::time::Filetime;
+use forensic_rs::utils::time::ForensicTimestamp;
 
 use crate::ese::{
     catalog::{Catalog, TableDef},
     column::{ColumnDef, OwnedColumnValue, TableSchema},
     header::Header,
     lv::LongValueStore,
-    page::{entries::PageEntry, root::RootEntry, Page, TreePage},
+    page::entries::PageEntry,
     reader::{FileReader, PageReader, SliceReader},
+    tree::{self, TreeStats, TreeWalker},
 };
 
 /// An open ESE database.  Holds a page reader, parsed header, and catalog.
+///
+/// `Send + Sync`: `forensic_rs::traits::db::ForensicDb` requires it, since a
+/// mounted database is cached and shared across parallel pipeline workers.
+/// `PageReader` implementations are `Send + Sync` (see `reader.rs`), `Header`/
+/// `Catalog` are plain data, and `lv_cache` is an `RwLock`, so `EseDb` gets
+/// this for free.
 pub struct EseDb {
     reader: Box<dyn PageReader>,
     pub(crate) header: Header,
     pub(crate) catalog: Catalog,
+    /// Long-value B-trees, memoized per LV root page. Without this, every
+    /// `iter_rows()` call on a table with long text/binary columns re-walked
+    /// the entire LV B-tree from scratch.
+    lv_cache: RwLock<HashMap<u32, Arc<LongValueStore>>>,
 }
 
 impl EseDb {
@@ -46,25 +58,38 @@ impl EseDb {
     /// Pages are read on demand — the entire file is never loaded into memory.
     pub fn open(path: impl AsRef<Path>) -> ForensicResult<Self> {
         let reader = FileReader::open(path.as_ref()).map_err(|e| {
-            ForensicError::bad_format_string(format!("Cannot open ESE file: {e}"))
+            ForensicError::io_error_with_source(e, "Cannot open ESE file")
         })?;
-        let header = {
-            let buf = reader.read_page(0, 4096.min(reader.total_size()))?;
-            Header::from_buff(&buf)?
-        };
-        let catalog = Catalog::from_db(&reader, &header)?;
-        Ok(Self { reader: Box::new(reader), header, catalog })
+        Self::from_reader(Box::new(reader))
     }
 
     /// Parse an ESE database from an in-memory byte vector.
     pub fn from_bytes(data: Vec<u8>) -> ForensicResult<Self> {
-        let reader = SliceReader(data);
+        Self::from_reader(Box::new(SliceReader::new(data)))
+    }
+
+    /// Parse an ESE database from an already-open `forensic_rs` `VirtualFile`
+    /// (used by [`crate::ese::format::EseFormatFactory`]).
+    pub fn from_virtual_file(file: Box<dyn forensic_rs::traits::vfs::VirtualFile>) -> ForensicResult<Self> {
+        Self::from_reader(Box::new(crate::ese::reader::VirtualFileReader::new(file)?))
+    }
+
+    /// Shared constructor: parse the header (from the first
+    /// `min(4096, total_size)` bytes — enough for the fixed-size header
+    /// struct without reading the whole file) and the catalog, then wrap
+    /// them with the given page reader.
+    pub(crate) fn from_reader(reader: Box<dyn PageReader>) -> ForensicResult<Self> {
         let header = {
-            let buf = reader.read_page(0, reader.total_size())?;
+            let buf = reader.read_page(0, 4096.min(reader.total_size()))?;
             Header::from_buff(&buf)?
         };
-        let catalog = Catalog::from_db(&reader, &header)?;
-        Ok(Self { reader: Box::new(reader), header, catalog })
+        let catalog = Catalog::from_db(reader.as_ref(), &header)?;
+        Ok(Self {
+            reader,
+            header,
+            catalog,
+            lv_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Reference to the parsed file header.
@@ -82,33 +107,41 @@ impl EseDb {
         self.catalog.tables.iter().map(|t| t.name.as_str()).collect()
     }
 
-    /// Get a table by name (case-insensitive).  Returns `None` if not found.
-    pub fn table(&self, name: &str) -> Option<Table<'_>> {
-        self.catalog.table(name).map(|def| Table { db: self, def })
+    /// Get a table by name (case-insensitive).
+    pub fn table(&self, name: &str) -> ForensicResult<Table<'_>> {
+        let def = self.catalog.table(name).ok_or_else(|| {
+            ForensicError::missing_data("table", "table not found in ESE database".into())
+        })?;
+        Ok(Table { db: self, def })
     }
 
-    /// Create a [`RowIter`] and column defs for a table directly from `EseDb`,
-    /// without going through a temporary `Table` handle.  Used by the SqlDb
-    /// bridge where the `Table` local cannot outlive `prepare()`.
-    pub(crate) fn iter_table_rows(
-        &self,
-        name: &str,
-    ) -> Option<(Vec<ColumnDef>, RowIter<'_>)> {
-        let def = self.catalog.table(name)?;
-        let schema = def.schema();
-        let lv_store = def.lv_fdp_page.and_then(|lv_page| {
-            LongValueStore::from_db(self.reader.as_ref(), &self.header, lv_page).ok()
-        });
-        Some((
-            def.columns.clone(),
-            RowIter {
-                db: self,
-                schema,
-                lv_store,
-                stack: vec![def.fdp_page],
-                pending: Vec::new(),
-            },
-        ))
+    /// Row cursor for `name`, bound to the database's own lifetime rather
+    /// than to any intermediate `Table` handle — this is what lets
+    /// `SrumDatabase`'s per-table accessors (and any `Box<dyn ForensicRows>`
+    /// caller) return just a cursor.
+    pub fn rows(&self, name: &str) -> ForensicResult<RowIter<'_>> {
+        Ok(self.table(name)?.iter_rows())
+    }
+
+    /// Look up (or build and cache) the long-value store rooted at `lv_page`.
+    fn long_values(&self, lv_page: u32) -> Option<Arc<LongValueStore>> {
+        if let Some(store) = self.lv_cache.read().unwrap_or_else(|e| e.into_inner()).get(&lv_page) {
+            return Some(store.clone());
+        }
+        let store = match LongValueStore::from_db(self.reader.as_ref(), &self.header, lv_page) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                forensic_rs::warn!(
+                    "ESE: long-value tree at page {lv_page} unreadable ({e}); LongText/LongBinary columns for this table will be NULL"
+                );
+                return None;
+            }
+        };
+        self.lv_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lv_page, store.clone());
+        Some(store)
     }
 }
 
@@ -127,23 +160,32 @@ impl<'db> Table<'db> {
     }
 
     /// Column definitions for this table.
-    pub fn columns(&self) -> &[ColumnDef] {
+    pub fn columns(&self) -> &'db [ColumnDef] {
         &self.def.columns
+    }
+
+    /// `forensic_rs`-shaped column definitions, precomputed in
+    /// `Catalog::from_db` and index-aligned with [`Table::columns`].
+    pub(crate) fn forensic_columns(&self) -> &'db [forensic_rs::traits::db::ForensicColumnDef] {
+        &self.def.forensic_columns
     }
 
     /// Iterate over all rows in this table.
     ///
     /// Long-value columns (LongText, LongBinary) are automatically resolved
-    /// from the table's LV B-tree when one exists.
-    pub fn iter_rows(&self) -> RowIter<'_> {
-        let lv_store = self.def.lv_fdp_page.and_then(|lv_page| {
-            LongValueStore::from_db(self.db.reader.as_ref(), &self.db.header, lv_page).ok()
-        });
+    /// from the table's LV B-tree when one exists (cached across calls — see
+    /// `EseDb`'s internal long-value cache).
+    ///
+    /// The returned [`RowIter`] borrows from the underlying [`EseDb`] (`'db`),
+    /// not from this `Table` handle, so the iterator remains valid even after
+    /// the `Table` value is dropped.
+    pub fn iter_rows(&self) -> RowIter<'db> {
+        let lv_store = self.def.lv_fdp_page.and_then(|lv_page| self.db.long_values(lv_page));
         RowIter {
             db: self.db,
             schema: self.def.schema(),
             lv_store,
-            stack: vec![self.def.fdp_page],
+            walker: TreeWalker::new(self.def.fdp_page),
             pending: Vec::new(),
         }
     }
@@ -152,12 +194,16 @@ impl<'db> Table<'db> {
 // ─── RowIter ─────────────────────────────────────────────────────────────────
 
 /// Iterator that traverses a table's B-tree and yields decoded [`Row`]s.
+///
+/// Cycle-safe: driven by [`TreeWalker`], which tracks visited page numbers
+/// directly rather than bounding recursion depth, so a branch page that
+/// (accidentally or adversarially) points back at an already-visited page
+/// terminates instead of looping.
 pub struct RowIter<'db> {
     db: &'db EseDb,
     schema: TableSchema,
-    lv_store: Option<LongValueStore>,
-    /// Pages still to be visited (acts as a DFS stack).
-    stack: Vec<u32>,
+    lv_store: Option<Arc<LongValueStore>>,
+    walker: TreeWalker,
     /// Rows decoded from the current leaf page, waiting to be yielded.
     pending: Vec<Row>,
 }
@@ -172,24 +218,28 @@ impl<'db> Iterator for RowIter<'db> {
                 return Some(row);
             }
 
-            let page_n = self.stack.pop()?;
-            let page = match load_page(self.db.reader.as_ref(), &self.db.header, page_n) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if !page.valid_page() || page.empty_page() {
-                continue;
-            }
-
+            let page = self.walker.next_page(self.db.reader.as_ref(), &self.db.header)?;
             match page.process_page() {
-                Err(_) => continue,
-                Ok(tree) => self.process_tree_page(tree),
+                Ok(tree) => {
+                    self.walker.push_children(&tree);
+                    self.process_tree_page(&tree);
+                }
+                Err(e) => {
+                    forensic_rs::debug!("ESE: cannot process page {}: {e}", page.page_number);
+                    self.walker.record_unparsable();
+                }
             }
         }
     }
 }
 
 impl<'db> RowIter<'db> {
+    /// Diagnostic counters for this cursor's traversal so far (pages skipped
+    /// as unreadable/invalid/revisited/unparsable).
+    pub fn stats(&self) -> TreeStats {
+        self.walker.stats()
+    }
+
     fn decode_tv(
         schema: &TableSchema,
         lv_store: Option<&LongValueStore>,
@@ -203,38 +253,17 @@ impl<'db> RowIter<'db> {
         Row::from_pairs(cols)
     }
 
-    fn process_tree_page(&mut self, tree: TreePage<'_>) {
-        match tree {
-            TreePage::Leaf(leaf) => {
-                for entry in leaf.entries.iter().rev() {
-                    if let PageEntry::TableValue(ref tv) = entry.data {
-                        self.pending
-                            .push(Self::decode_tv(&self.schema, self.lv_store.as_ref(), tv));
-                    }
-                }
+    fn process_tree_page(&mut self, tree: &crate::ese::page::TreePage<'_>) {
+        // Leaf entries decode in reverse so `pending.pop()` yields them in
+        // forward (on-disk) order.
+        let mut decoded = Vec::new();
+        tree::for_each_leaf_entry(tree, |entry| {
+            if let PageEntry::TableValue(tv) = entry {
+                decoded.push(Self::decode_tv(&self.schema, self.lv_store.as_deref(), tv));
             }
-            TreePage::Branch(branch) => {
-                for entry in branch.entries.iter().rev() {
-                    self.stack.push(entry.child_page_number);
-                }
-            }
-            TreePage::Root(root) => {
-                for entry in root.entries.iter().rev() {
-                    match entry {
-                        RootEntry::Branch(b) => self.stack.push(b.child_page_number),
-                        RootEntry::Leaf(leaf_entry) => {
-                            if let PageEntry::TableValue(ref tv) = leaf_entry.data {
-                                self.pending.push(Self::decode_tv(
-                                    &self.schema,
-                                    self.lv_store.as_ref(),
-                                    tv,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        });
+        decoded.reverse();
+        self.pending.extend(decoded);
     }
 }
 
@@ -326,8 +355,8 @@ impl Row {
         self.get(name).and_then(|v| v.as_bool())
     }
 
-    /// Get a `Filetime` from a `DateTime` column (case-insensitive).
-    pub fn get_datetime(&self, name: &str) -> Option<Filetime> {
+    /// Get a `ForensicTimestamp` from a `DateTime` column (case-insensitive).
+    pub fn get_datetime(&self, name: &str) -> Option<ForensicTimestamp> {
         self.get(name).and_then(|v| v.as_datetime())
     }
 
@@ -337,15 +366,6 @@ impl Row {
     }
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
-fn load_page<'r>(reader: &'r dyn PageReader, header: &Header, page_n: u32) -> ForensicResult<Page<'r>> {
-    let offset = header.page_to_file_offset(page_n as u64) as usize;
-    let size = header.page_size as usize;
-    let data = reader.read_page(offset, size)?;
-    Page::new(data, page_n, header)
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -353,9 +373,16 @@ mod tst {
     use super::*;
     use crate::ese::tst::*;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn esedb_is_send_sync() {
+        assert_send_sync::<EseDb>();
+    }
+
     #[test]
     fn esedb_from_system_identity() {
-        let (data, _) = get_mdb_and_header();
+        let Some((data, _)) = get_mdb_and_header() else { return };
         let db = EseDb::from_bytes(data).expect("EseDb::from_bytes should succeed");
         let names = db.table_names();
         assert!(!names.is_empty(), "expected at least one table");
@@ -363,11 +390,12 @@ mod tst {
             let table = db.table(name).expect("table() should find table from table_names()");
             assert_eq!(*name, table.name());
         }
+        assert!(db.table("does-not-exist-anywhere").is_err());
     }
 
     #[test]
     fn esedb_iterate_ual_clients() {
-        let (data, _) = get_mdb_and_header_ual();
+        let Some((data, _)) = get_mdb_and_header_ual() else { return };
         let db = EseDb::from_bytes(data).expect("EseDb::from_bytes should succeed for UAL");
         let names = db.table_names();
         assert!(!names.is_empty());
@@ -376,5 +404,22 @@ mod tst {
         let rows: Vec<Row> = first.iter_rows().take(10).collect();
         // We just need the iterator to not panic; a table may be empty.
         let _ = rows;
+    }
+
+    #[test]
+    fn long_value_store_is_cached_across_iter_rows_calls() {
+        let Some(bytes) = get_srum_bytes() else { return };
+        let db = EseDb::from_bytes(bytes).expect("SRUDB.dat should parse");
+        // Find any table with an LV tree.
+        let Some(def) = db.catalog.tables.iter().find(|t| t.lv_fdp_page.is_some()) else { return };
+        let lv_page = def.lv_fdp_page.unwrap();
+        assert!(db.lv_cache.read().unwrap().is_empty());
+        let table = db.table(&def.name).unwrap();
+        let _ = table.iter_rows().count();
+        assert!(db.lv_cache.read().unwrap().contains_key(&lv_page));
+        let cached = db.lv_cache.read().unwrap().get(&lv_page).unwrap().clone();
+        let _ = table.iter_rows().count();
+        // Second call must reuse the same Arc, not rebuild.
+        assert!(Arc::ptr_eq(&cached, db.lv_cache.read().unwrap().get(&lv_page).unwrap()));
     }
 }

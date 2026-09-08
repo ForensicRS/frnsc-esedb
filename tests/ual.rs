@@ -17,12 +17,23 @@ const PATH_CURRENT: &str = "./artifacts/UAL/UAL/Current.mdb";
 const PATH_GUID: &str =
     "./artifacts/UAL/UAL/{FC57251C-CDA7-4D0E-9071-60F47E1DFC55}.mdb";
 
-fn open_current() -> EseDb {
-    EseDb::open(PATH_CURRENT).expect("failed to open UAL/Current.mdb")
+/// `artifacts/` is gitignored, so these fixtures are only present for
+/// whoever placed them there locally. Tests skip (rather than fail) when
+/// they're absent.
+fn open_current() -> Option<EseDb> {
+    if !std::path::Path::new(PATH_CURRENT).exists() {
+        eprintln!("SKIP: fixture '{PATH_CURRENT}' unavailable");
+        return None;
+    }
+    Some(EseDb::open(PATH_CURRENT).expect("failed to open UAL/Current.mdb"))
 }
 
-fn open_guid_db() -> EseDb {
-    EseDb::open(PATH_GUID).expect("failed to open GUID-named UAL archive")
+fn open_guid_db() -> Option<EseDb> {
+    if !std::path::Path::new(PATH_GUID).exists() {
+        eprintln!("SKIP: fixture '{PATH_GUID}' unavailable");
+        return None;
+    }
+    Some(EseDb::open(PATH_GUID).expect("failed to open GUID-named UAL archive"))
 }
 
 // ── Current.mdb — Header ──────────────────────────────────────────────────────
@@ -30,14 +41,14 @@ fn open_guid_db() -> EseDb {
 /// Page size must be 4 096 bytes.
 #[test]
 fn ual_current_header_page_size() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     assert_eq!(4096, db.header().page_size, "unexpected page size in Current.mdb");
 }
 
 /// Format fingerprint must be Exchange2013Ad2016 (revision 0x14).
 #[test]
 fn ual_current_header_fingerprint() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     assert_eq!(
         FileFormatFingerprint::Exchange2013Ad2016,
         db.header().fingerprint(),
@@ -50,7 +61,7 @@ fn ual_current_header_fingerprint() {
 /// correctly rather than returning Unknown.
 #[test]
 fn ual_current_header_state_parseable() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let state = db.header().state();
     assert_ne!(
         DatabaseState::Unknown,
@@ -70,7 +81,7 @@ fn ual_current_header_state_parseable() {
 /// The catalog must contain at least one user table.
 #[test]
 fn ual_current_catalog_has_tables() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     assert!(
         !db.table_names().is_empty(),
         "expected at least one table in Current.mdb"
@@ -80,7 +91,7 @@ fn ual_current_catalog_has_tables() {
 /// The four known UAL user tables must all be present.
 #[test]
 fn ual_current_known_tables() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let names: Vec<&str> = db.table_names();
     for expected in &["CLIENTS", "DNS", "ROLE_ACCESS", "VIRTUALMACHINES"] {
         assert!(
@@ -95,7 +106,7 @@ fn ual_current_known_tables() {
 /// DNS must have exactly the three expected columns.
 #[test]
 fn ual_current_dns_columns() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("DNS").expect("DNS table not found");
     let col_names: Vec<&str> = tbl.columns().iter().map(|c| c.name.as_str()).collect();
     for expected in &["LastSeen", "Address", "HostName"] {
@@ -109,7 +120,7 @@ fn ual_current_dns_columns() {
 /// ROLE_ACCESS must have `RoleGuid`, `FirstSeen`, and `LastSeen`.
 #[test]
 fn ual_current_role_access_columns() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("ROLE_ACCESS").expect("ROLE_ACCESS table not found");
     let col_names: Vec<&str> = tbl.columns().iter().map(|c| c.name.as_str()).collect();
     for expected in &["RoleGuid", "FirstSeen", "LastSeen"] {
@@ -123,7 +134,7 @@ fn ual_current_role_access_columns() {
 /// CLIENTS must have the core access-tracking columns.
 #[test]
 fn ual_current_clients_core_columns() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("CLIENTS").expect("CLIENTS table not found");
     let col_names: Vec<&str> = tbl.columns().iter().map(|c| c.name.as_str()).collect();
     for expected in &[
@@ -146,7 +157,7 @@ fn ual_current_clients_core_columns() {
 /// `LastSeenActive`, and `SerialNumber`.
 #[test]
 fn ual_current_virtualmachines_columns() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("VIRTUALMACHINES").expect("VIRTUALMACHINES table not found");
     let col_names: Vec<&str> = tbl.columns().iter().map(|c| c.name.as_str()).collect();
     for expected in &["VmGuid", "BIOSGuid", "CreationTime", "LastSeenActive", "SerialNumber"] {
@@ -162,7 +173,7 @@ fn ual_current_virtualmachines_columns() {
 /// Iterating all tables must not panic and must yield at least one row overall.
 #[test]
 fn ual_current_all_tables_iterable() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let mut total = 0usize;
     for name in db.table_names() {
         let tbl = db.table(name).unwrap();
@@ -178,7 +189,7 @@ fn ual_current_all_tables_iterable() {
 /// Every DNS row must have a non-nil, non-empty HostName.
 #[test]
 fn ual_current_dns_rows_have_hostname() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("DNS").expect("DNS table not found");
     let rows: Vec<_> = tbl.iter_rows().collect();
     assert!(!rows.is_empty(), "DNS table must not be empty");
@@ -198,7 +209,7 @@ fn ual_current_dns_rows_have_hostname() {
 /// Every DNS row must have a non-nil Address.
 #[test]
 fn ual_current_dns_rows_have_address() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("DNS").expect("DNS table not found");
     for row in tbl.iter_rows() {
         let val = row.get("Address");
@@ -218,7 +229,7 @@ fn ual_current_dns_rows_have_address() {
 /// Every ROLE_ACCESS row must have a non-nil RoleGuid.
 #[test]
 fn ual_current_role_access_rows_have_role_guid() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("ROLE_ACCESS").expect("ROLE_ACCESS table not found");
     let rows: Vec<_> = tbl.iter_rows().collect();
     assert!(!rows.is_empty(), "ROLE_ACCESS must have at least one row");
@@ -235,7 +246,7 @@ fn ual_current_role_access_rows_have_role_guid() {
 /// CLIENTS must have more than one row (it is the primary access log).
 #[test]
 fn ual_current_clients_has_rows() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("CLIENTS").expect("CLIENTS table not found");
     let count = tbl.iter_rows().count();
     assert!(count > 0, "CLIENTS table must not be empty");
@@ -244,7 +255,7 @@ fn ual_current_clients_has_rows() {
 /// Every CLIENTS row must have a non-nil TotalAccesses integer value.
 #[test]
 fn ual_current_clients_total_accesses_numeric() {
-    let db = open_current();
+    let Some(db) = open_current() else { return; };
     let tbl = db.table("CLIENTS").expect("CLIENTS table not found");
     for row in tbl.iter_rows() {
         match row.get("TotalAccesses") {
@@ -262,13 +273,13 @@ fn ual_current_clients_total_accesses_numeric() {
 /// The GUID-named archive must open without error.
 #[test]
 fn ual_guid_db_opens() {
-    let _db = open_guid_db();
+    let Some(_db) = open_guid_db() else { return; };
 }
 
 /// The GUID archive must have the same four UAL user tables as Current.mdb.
 #[test]
 fn ual_guid_db_known_tables() {
-    let db = open_guid_db();
+    let Some(db) = open_guid_db() else { return; };
     let names: Vec<&str> = db.table_names();
     for expected in &["CLIENTS", "DNS", "ROLE_ACCESS", "VIRTUALMACHINES"] {
         assert!(
@@ -281,7 +292,7 @@ fn ual_guid_db_known_tables() {
 /// All tables in the GUID archive must iterate without panicking.
 #[test]
 fn ual_guid_db_all_tables_iterable() {
-    let db = open_guid_db();
+    let Some(db) = open_guid_db() else { return; };
     for name in db.table_names() {
         let tbl = db.table(name).unwrap();
         for _row in tbl.iter_rows() {}
@@ -292,7 +303,7 @@ fn ual_guid_db_all_tables_iterable() {
 /// with 236 rows in this artifact).
 #[test]
 fn ual_guid_db_clients_has_rows() {
-    let db = open_guid_db();
+    let Some(db) = open_guid_db() else { return; };
     let tbl = db.table("CLIENTS").expect("CLIENTS table not found in GUID archive");
     assert!(
         tbl.iter_rows().count() > 0,
@@ -303,7 +314,7 @@ fn ual_guid_db_clients_has_rows() {
 /// The GUID archive DNS table must have rows.
 #[test]
 fn ual_guid_db_dns_has_rows() {
-    let db = open_guid_db();
+    let Some(db) = open_guid_db() else { return; };
     let tbl = db.table("DNS").expect("DNS table not found in GUID archive");
     assert!(
         tbl.iter_rows().count() > 0,
@@ -314,8 +325,8 @@ fn ual_guid_db_dns_has_rows() {
 /// Page size of the GUID archive must match Current.mdb (both created by the same OS).
 #[test]
 fn ual_guid_db_header_page_size() {
-    let current = open_current();
-    let archive = open_guid_db();
+    let Some(current) = open_current() else { return; };
+    let Some(archive) = open_guid_db() else { return; };
     assert_eq!(
         current.header().page_size,
         archive.header().page_size,

@@ -2,7 +2,6 @@ use std::borrow::Cow;
 
 use branch::BranchPage;
 use forensic_rs::err::{ForensicError, ForensicResult};
-use key::PageKeyRef;
 use leaf::LeafPage;
 use root::RootPage;
 
@@ -10,7 +9,6 @@ use super::{header::Header, tag::{Tag, TagData, TagReader}};
 
 pub mod root;
 pub mod branch;
-pub mod key;
 pub mod leaf;
 pub mod entries;
 
@@ -31,6 +29,14 @@ pub enum TreePage<'a> {
     Root(RootPage<'a>),
     Branch(BranchPage<'a>),
     Leaf(LeafPage<'a>)
+}
+
+/// True for the two "large" ESE page sizes (16 KiB / 32 KiB) that carry the
+/// Win7 extended page-header checksum. The page sizes here are the real ESE
+/// values (16 384 / 32 768) — a prior version of this check compared against
+/// 16 000 / 32 000, which made the extended-header branch permanently dead.
+fn page_size_is_large(len: usize) -> bool {
+    len == 16_384 || len == 32_768
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +139,7 @@ impl<'a> TryFrom<&'a PageChecksum> for &'a PageChecksumWin7 {
     fn try_from(value: &'a PageChecksum) -> Result<Self, Self::Error> {
         match value {
             PageChecksum::Win7(v) => Ok(v),
-            _ => Err(ForensicError::bad_format_str("Not a Win7 checksum"))
+            _ => Err(ForensicError::invalid_format("ESE", "Not a Win7 checksum"))
         }
     }
 }
@@ -144,7 +150,7 @@ impl<'a> TryFrom<&'a PageChecksum> for &'a PageChecksumExchange2003 {
     fn try_from(value: &'a PageChecksum) -> Result<Self, Self::Error> {
         match value {
             PageChecksum::Exchange2003(v) => Ok(v),
-            _ => Err(ForensicError::bad_format_str("Not a Exchange2003 checksum"))
+            _ => Err(ForensicError::invalid_format("ESE", "Not a Exchange2003 checksum"))
         }
     }
 }
@@ -154,7 +160,7 @@ impl<'a> TryFrom<&'a PageChecksum> for &'a PageChecksumWinVista {
     fn try_from(value: &'a PageChecksum) -> Result<Self, Self::Error> {
         match value {
             PageChecksum::WinVista(v) => Ok(v),
-            _ => Err(ForensicError::bad_format_str("Not a WinVista checksum"))
+            _ => Err(ForensicError::invalid_format("ESE", "Not a WinVista checksum"))
         }
     }
 }
@@ -215,39 +221,57 @@ impl From<&PageHeaderRepr> for PageHeader {
 
 impl PageHeader {
     pub fn from_buff(buffer : &[u8], version : u32, revision : u32) -> ForensicResult<PageHeader> {
-        let (head, data, tail) = unsafe {&buffer[..].align_to::<PageHeaderRepr>()};
+        forensic_rs::ensure_min_length!(std::mem::size_of::<PageHeaderRepr>(), buffer.len(), "ESE page header");
+        // SAFETY: `PageHeaderRepr` is `#[repr(C, packed)]` (alignment 1) and
+        // every field is a plain integer — any bit pattern is valid, so
+        // `align_to` cannot produce an invalid value. Alignment 1 also means
+        // `head` is always empty; the length check above (not
+        // `head.is_empty()`, which is always true) is what actually matters.
+        let (head, data, _tail) = unsafe { buffer.align_to::<PageHeaderRepr>() };
         if !head.is_empty() || data.is_empty() {
-            return Err(forensic_rs::err::ForensicError::bad_format_str("Invalid alignement"));
+            return Err(forensic_rs::err::ForensicError::invalid_format("ESE", "Invalid alignement"));
         }
         let mut page : PageHeader = (&data[0]).into();
         page.version = version;
         page.revision = revision;
-        if version == 0x602 {
+        // 0x620, not 0x602 — verified against the real ESE version field
+        // (`artifacts/sru/SRUDB.dat` bytes 8..12 = `20 06 00 00`). The typo
+        // meant this entire checksum/extension-refinement block was dead for
+        // every real database; every bug below was consequently unreachable
+        // until this was corrected, so both must land together.
+        if version == 0x620 {
             if revision < 0x0000000b {
                 // Before Exchange 2003 SP1 and Windows Vista
                 page.checksum = PageChecksum::Exchange2003(PageChecksumExchange2003 {
                     xor : u32::from_le_bytes(buffer[0..4].try_into().unwrap_or_default()),
-                    page_number : u32::from_le_bytes(buffer[4..9].try_into().unwrap_or_default())
+                    page_number : u32::from_le_bytes(buffer[4..8].try_into().unwrap_or_default())
                 });
             } else if revision < 0x00000011 {
                 // Exchange 2003 SP1 and Windows Vista and later
                 page.checksum = PageChecksum::WinVista(PageChecksumWinVista {
                     xor_checksum : u32::from_le_bytes(buffer[0..4].try_into().unwrap_or_default()),
-                    ecc_checksum : u32::from_le_bytes(buffer[4..9].try_into().unwrap_or_default())
+                    ecc_checksum : u32::from_le_bytes(buffer[4..8].try_into().unwrap_or_default())
                 });
             }else if revision >= 0x00000011 {
                 // Exchange 2003 SP1 and Windows Vista and later
                 page.checksum = PageChecksum::Win7(PageChecksumWin7 {
                     checksum : u64::from_le_bytes(buffer[0..8].try_into().unwrap_or_default())
                 });
-                if buffer.len() == 16_000 || buffer.len() == 32_000 {
-                    // Extended format
+                // The Win7 extended header lives at bytes [40..80] of the
+                // page itself, immediately after the 40-byte base header —
+                // *not* in whatever bytes `align_to` leaves over as `tail`
+                // (which is the very end of the whole page buffer and, for
+                // the previous buggy size check, was usually empty). Gated
+                // on page size and revision, matching libesedb's model,
+                // rather than the page's exact byte length.
+                if buffer.len() >= 80 && (page_size_is_large(buffer.len()) ) && revision >= 0x00000011 {
+                    let ext = &buffer[40..80];
                     page.extension = Some(PageExtension::Win7(PageExtensionWin7 {
-                        ext_checksum1 : u64::from_le_bytes(tail[0..8].try_into().unwrap_or_default()),
-                        ext_checksum2 : u64::from_le_bytes(tail[8..16].try_into().unwrap_or_default()),
-                        ext_checksum3 : u64::from_le_bytes(tail[16..24].try_into().unwrap_or_default()),
-                        page_number : u64::from_le_bytes(tail[24..32].try_into().unwrap_or_default()),
-                        unknown : u64::from_le_bytes(tail[32..40].try_into().unwrap_or_default()),
+                        ext_checksum1 : u64::from_le_bytes(ext[0..8].try_into().unwrap_or_default()),
+                        ext_checksum2 : u64::from_le_bytes(ext[8..16].try_into().unwrap_or_default()),
+                        ext_checksum3 : u64::from_le_bytes(ext[16..24].try_into().unwrap_or_default()),
+                        page_number : u64::from_le_bytes(ext[24..32].try_into().unwrap_or_default()),
+                        unknown : u64::from_le_bytes(ext[32..40].try_into().unwrap_or_default()),
                     }));
                     page.header_size = 80;
                 }
@@ -331,10 +355,19 @@ impl<'p> Page<'p> {
     pub fn new(data : Cow<'p, [u8]>, page_number : u32, header : &Header) -> ForensicResult<Self> {
         let page_size = header.page_size as usize;
         if data.len() != page_size {
-            return Err(ForensicError::bad_format_str("Page data size does not match Header page size"))
+            return Err(ForensicError::invalid_format("ESE", "Page data size does not match Header page size"))
         }
         let page_header = PageHeader::from_buff(&data, header.version, header.file_format_revision)?;
-        let tags = if !page_header.is_empty_flag() && (page_header.available_page_tag > 1 && data.len() > page_header.available_page_tag as usize) {
+        // The tag array occupies `available_page_tag * 4` bytes at the *end*
+        // of the page; validate that it actually fits there before trusting
+        // it enough to loop over it. (A prior version of this check compared
+        // the page's total byte length against the tag *count* — a
+        // byte-vs-count comparison that was true for almost any tag count
+        // and caught nothing.)
+        let tag_table_fits = (page_header.header_size as usize)
+            .checked_add((page_header.available_page_tag as usize).saturating_mul(4))
+            .is_some_and(|end| end <= page_size);
+        let tags = if !page_header.is_empty_flag() && page_header.available_page_tag > 1 && tag_table_fits {
             let mut tags = Vec::with_capacity(page_header.available_page_tag as usize);
             let tag_reader = TagReader::new(header.page_size, header.file_format_revision);
             for tag_n in 0..page_header.available_page_tag {
@@ -374,12 +407,12 @@ impl<'p> Page<'p> {
     pub fn get_tag_data(&self, tag_n : usize) -> ForensicResult<&[u8]> {
         let tag = match self.tags.get(tag_n) {
             Some(v) => v,
-            None => return Err(ForensicError::missing_str("Cannot find tag"))
+            None => return Err(ForensicError::missing_data("ESE", "Cannot find tag".into()))
         };
         let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
         let tag_end = tag_offset + tag.value_size as usize;
         if tag_end > self.data.len() {
-            return Err(ForensicError::missing_str("Tag size out of bounds"))
+            return Err(ForensicError::missing_data("ESE", "Tag size out of bounds".into()))
         }
         let data = &self.data[tag_offset..tag_end];
         Ok(data)
@@ -387,12 +420,12 @@ impl<'p> Page<'p> {
     pub fn get_tag<'a>(&'a self, tag_n : usize) -> ForensicResult<TagData<'a>> {
         let tag = match self.tags.get(tag_n) {
             Some(v) => v,
-            None => return Err(ForensicError::missing_str("Cannot find tag"))
+            None => return Err(ForensicError::missing_data("ESE", "Cannot find tag".into()))
         };
         let tag_offset = self.header.header_size as usize + tag.value_offset as usize;
         let tag_end = tag_offset + tag.value_size as usize;
         if tag_end > self.data.len() {
-            return Err(ForensicError::missing_str("Tag size out of bounds"))
+            return Err(ForensicError::missing_data("ESE", "Tag size out of bounds".into()))
         }
         let data = &self.data[tag_offset..tag_end];
         Ok(TagData {
@@ -435,13 +468,9 @@ impl<'p> Page<'p> {
         }else if self.is_root() {
             return Ok(TreePage::Root(RootPage::new(self)?))
         }
-        Err(ForensicError::bad_format_str("No external header"))
+        Err(ForensicError::invalid_format("ESE", "No external header"))
     }
 
-    pub fn get_page_keys_if_root<'a>(&'a self, key_n : usize) -> ForensicResult<PageKeyRef<'a>> {
-        let tag_data: &[u8] = self.get_tag_data(key_n + 1)?;
-        PageKeyRef::new(tag_data)
-    }
     /// Creates a zero-filled dummy page for use in unit tests where the
     /// `Page` argument is not actually accessed (e.g. `TableValueEntry::new`).
     #[cfg(test)]
@@ -496,16 +525,16 @@ impl<'p> Page<'p> {
 mod tst {
 
     use std::borrow::Cow;
-    use crate::ese::{page::PageChecksumWin7, tst::{get_mdb_and_header, get_mdb_and_header_ual, open_debug_file, to_debug_file}};
+    use crate::ese::{page::PageChecksumWin7, tst::{get_mdb_and_header, get_mdb_and_header_ual}};
 
     use super::{Page, PageHeader};
 
     /// Getting info from `esentutl.exe /ms .\artifacts\SystemIdentity.mdb /p1`
     #[test]
     fn should_load_mdb_header() {
-        let (buffer, header) = get_mdb_and_header();
-        assert_eq!(8192, header.page_to_file_offset(1));
-        let page_header = PageHeader::from_buff(&buffer[header.page_to_file_offset(1) as usize..], header.version, header.file_format_revision).unwrap();
+        let Some((buffer, header)) = get_mdb_and_header() else { return };
+        assert_eq!(8192, header.page_to_file_offset(1).unwrap());
+        let page_header = PageHeader::from_buff(&buffer[header.page_to_file_offset(1).unwrap() as usize..], header.version, header.file_format_revision).unwrap();
         let checksum: &PageChecksumWin7 = (&page_header.checksum).try_into().unwrap();
         assert_eq!(0x7fdf7fdf0001a77c, checksum.checksum);
         assert_eq!(0,page_header.previous_page_number);
@@ -516,7 +545,7 @@ mod tst {
         assert_eq!(1, page_header.available_page_tag);
         assert_eq!(0xA803, page_header.page_flags);
 
-        let page_header = PageHeader::from_buff(&buffer[header.page_to_file_offset(2) as usize..], header.version, header.file_format_revision).unwrap();
+        let page_header = PageHeader::from_buff(&buffer[header.page_to_file_offset(2).unwrap() as usize..], header.version, header.file_format_revision).unwrap();
         let checksum: &PageChecksumWin7 = (&page_header.checksum).try_into().unwrap();
         assert_eq!(0x0192019200ec59d4, checksum.checksum);
         assert_eq!(0,page_header.previous_page_number);
@@ -526,37 +555,41 @@ mod tst {
         assert_eq!(0, page_header.available_uncommited_data_size);
         assert_eq!(2, page_header.available_page_tag);
         assert_eq!(0xA823, page_header.page_flags);
-        
+
     }
 
     #[test]
     fn should_load_full_page() {
-        let (buffer, header) = get_mdb_and_header_ual();
-        let mut dbg = open_debug_file("ual-test");
-        to_debug_file(&mut dbg, " HEADER ",format!("{:#?}", header));
+        let Some((buffer, header)) = get_mdb_and_header_ual() else { return };
         let page_n = 4u32;
-        let page_offset = header.page_to_file_offset(page_n as u64) as usize;
+        let page_offset = header.page_to_file_offset(page_n as u64).unwrap() as usize;
         let _page = Page::new(Cow::Owned(buffer[page_offset..page_offset + header.page_size as usize].to_vec()), page_n, &header).unwrap();
-        //assert_eq!(&[Tag { value_offset: 0, tag_flags: 0, value_size: 16 }, Tag { value_offset: 2775, tag_flags: 0, value_size: 19 }, Tag { value_size: 14, tag_flags: 0, value_offset: 2794 }, Tag { value_size: 6, tag_flags: 0, value_offset: 2769 }], &page.tags[..]);
 
         for page_n in 4u32..254 {
-            let page_offset = header.page_to_file_offset(page_n as u64) as usize;
+            let page_offset = header.page_to_file_offset(page_n as u64).unwrap() as usize;
             let page = Page::new(Cow::Owned(buffer[page_offset..page_offset + header.page_size as usize].to_vec()), page_n, &header).unwrap();
-            //to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", page));
-            to_debug_file(&mut dbg, &format!("Page {page_n} Flags"),format!("{:#?}", page.header.flags()));
             if page.tags.is_empty() {
                 continue;
             }
             if !page.valid_page() {
-                println!("Invalid page {page_n}");
                 continue
             }
             if page.empty_page() {
                 continue
             }
-            let tree_page = page.process_page().unwrap();
-            to_debug_file(&mut dbg, &format!("Page {page_n} Header"),format!("{:#?}", tree_page));
+            let _tree_page = page.process_page().unwrap();
         }
-        
+    }
+
+    #[test]
+    fn page_size_16000_no_longer_panics() {
+        // Regression guard for the historical (16_000/32_000-vs-16_384/32_768)
+        // typo: neither a bogus 16_000-byte page nor a real 16_384-byte one
+        // should panic while building a `PageHeader`.
+        let buffer = vec![0u8; 16_000];
+        let _ = PageHeader::from_buff(&buffer, 0x620, 0x11);
+        let buffer = vec![0u8; 16_384];
+        let header = PageHeader::from_buff(&buffer, 0x620, 0x11).unwrap();
+        assert_eq!(80, header.header_size, "16 KiB pages must read the Win7 extension and set header_size=80");
     }
 }

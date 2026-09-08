@@ -32,12 +32,16 @@ impl RootHeader {
         }else if data.len() == 16{
             (16, 0)
         } else {
-            return Err(ForensicError::bad_format_string(format!("Invalid Root Header size: {}", data.len())))
+            return Err(ForensicError::invalid_format("ESE", format!("Invalid Root Header size: {}", data.len())))
         };
         if header_size > data.len() {
-            return Err(ForensicError::bad_format_string(format!("Invalid Root Header size: {} vs expected={}", data.len(), header_size)))
+            return Err(ForensicError::invalid_format("ESE", format!("Invalid Root Header size: {} vs expected={}", data.len(), header_size)))
         }
-        let number_of_pages = u32::from_le_bytes(data[0..4].try_into().unwrap_or_default());
+        // `offset` already accounts for the leading alignment byte present on
+        // revision >= 0x14 (25-byte) headers; every field, `number_of_pages`
+        // included, must be read starting from it — reading from a hardcoded
+        // `0` here shifted every field on 25-byte headers by one byte.
+        let number_of_pages = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or_default());
         offset += 4;
         let parent_father_data_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or_default());
         offset += 4;

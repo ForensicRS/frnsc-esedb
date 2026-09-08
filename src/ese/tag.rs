@@ -36,7 +36,7 @@ pub struct TagData <'a> {
 impl Tag {
     pub fn from_buff(buffer : &[u8], revision : u32, page_size : u32) -> ForensicResult<Self> {
         if buffer.len() < 4 {
-            return Err(forensic_rs::err::ForensicError::bad_format_str("Invalid buffer size. Must be at least 4 bytes"))
+            return Err(forensic_rs::err::ForensicError::invalid_format("ESE", "Invalid buffer size. Must be at least 4 bytes"))
         }
         let size = u16::from_le_bytes(buffer[0..2].try_into().unwrap_or_default());
         let offset = u16::from_le_bytes(buffer[2..4].try_into().unwrap_or_default());

@@ -1,7 +1,6 @@
-use forensic_rs::{
-    err::{ForensicError, ForensicResult},
-    prelude::NotificationType,
-};
+//! B-tree branch (interior) page entries.
+
+use forensic_rs::err::{ForensicError, ForensicResult};
 
 use super::Page;
 
@@ -34,19 +33,29 @@ impl<'a> BranchPageHeader<'a> {
 impl<'a> BranchPageEntry<'a> {
     pub fn new(data: &'a [u8]) -> ForensicResult<BranchPageEntry<'a>> {
         if data.len() < 6 {
-            return Err(ForensicError::bad_format_str(
+            return Err(ForensicError::invalid_format("ESE", 
                 "Branch Entry must have 6 or more bytes",
             ));
         }
 
         let page_key_size = u16::from_le_bytes([data[0], data[1]]);
-        if data.len() < (6 + page_key_size) as usize {
-            return Err(ForensicError::bad_format_str(
+        // Widen to `usize` *before* adding: `6 + page_key_size` as a `u16` sum
+        // overflows for any `page_key_size >= 65530`, which would wrap the
+        // bounds check instead of failing it and let the slices below panic.
+        let required = 6usize.checked_add(page_key_size as usize).ok_or_else(|| {
+            ForensicError::invalid_format("ESE", "Branch Entry size overflow")
+        })?;
+        if data.len() < required {
+            return Err(ForensicError::invalid_format("ESE", 
                 "Branch Entry size does not correspond with expected",
             ));
         }
         let page_key = &data[2..2 + page_key_size as usize];
-        let child_page_number = u32::from_le_bytes(data[2 + page_key_size as usize..6 + page_key_size as usize].try_into().unwrap_or_default());
+        let child_page_number = u32::from_le_bytes(
+            data[2 + page_key_size as usize..6 + page_key_size as usize]
+                .try_into()
+                .map_err(|_| ForensicError::invalid_format("ESE", "Branch Entry child page number out of bounds"))?,
+        );
         Ok(BranchPageEntry {
             page_key_size,
             page_key,
@@ -56,14 +65,13 @@ impl<'a> BranchPageEntry<'a> {
 
     pub fn branch_entries(page: &'a Page<'_>) -> ForensicResult<Vec<BranchPageEntry<'a>>> {
         Ok(if page.tags.len() > 1 {
-            let mut entries = Vec::with_capacity(page.tags.len().wrapping_rem(1));
+            let mut entries = Vec::with_capacity(page.tags.len().saturating_sub(1));
             for i in 1..page.tags.len() {
                 let tag = match page.get_tag_data(i) {
                     Ok(v) => v,
                     Err(e) => {
-                        forensic_rs::notify_low!(
-                            NotificationType::Informational,
-                            "Cannot get tag {i} of page {}: {e}",
+                        forensic_rs::debug!(
+                            "ESE: cannot get tag {i} of page {}: {e}",
                             page.page_number
                         );
                         continue;
@@ -72,9 +80,8 @@ impl<'a> BranchPageEntry<'a> {
                 let entry = match BranchPageEntry::new(tag) {
                     Ok(v) => v,
                     Err(e) => {
-                        forensic_rs::notify_low!(
-                            NotificationType::Informational,
-                            "Cannot parse branch entry {i} of page {}: {e}",
+                        forensic_rs::debug!(
+                            "ESE: cannot parse branch entry {i} of page {}: {e}",
                             page.page_number
                         );
                         continue;
@@ -96,5 +103,34 @@ impl<'a> BranchPage<'a> {
             header: BranchPageHeader::new(tag_0),
             entries: BranchPageEntry::branch_entries(page)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tst {
+    use super::*;
+
+    #[test]
+    fn rejects_short_entry() {
+        assert!(BranchPageEntry::new(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn key_size_65535_does_not_overflow_or_panic() {
+        // page_key_size = 0xFFFF: `6 + 0xFFFF` overflows a u16 sum, which used
+        // to wrap and defeat the bounds check. Must error cleanly instead.
+        let data = [0xFFu8, 0xFF, 0, 0, 0, 0];
+        let result = BranchPageEntry::new(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exact_fit_entry_parses() {
+        // page_key_size = 2, key = [0xAA, 0xBB], child_page_number = 7.
+        let data = [2u8, 0, 0xAA, 0xBB, 7, 0, 0, 0];
+        let entry = BranchPageEntry::new(&data).expect("exact-fit entry should parse");
+        assert_eq!(2, entry.page_key_size);
+        assert_eq!(&[0xAA, 0xBB], entry.page_key);
+        assert_eq!(7, entry.child_page_number);
     }
 }

@@ -1,9 +1,18 @@
 [package]
 name = "frnsc-esedb"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Native Rust parser for Microsoft ESE (Extensible Storage Engine) databases, implementing the forensic-rs ForensicDb/FormatFactory traits, with a SRUM (SRUDB.dat) reader on top."
+authors = ["Samuel Garcés Marín <samuel.garces@protonmail.com>"]
+license = "MIT"
+repository = "https://github.com/ForensicRS/frnsc-esedb"
+keywords = ["forensic", "ese", "esedb", "srum", "windows"]
+categories = ["parsing"]
+readme = "README.md"
+exclude = ["artifacts/*", "docs/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-forensic-rs = "0.13"
+forensic-rs = "0.14"

@@ -24,7 +24,7 @@ fn main() {
         let accesses = row.get_i64("TotalAccesses").unwrap_or(0);
         let insert = row
             .get_datetime("InsertDate")
-            .map(|ft| format!("{ft:?}"))
+            .map(|ts| format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", ts.year(), ts.month(), ts.day(), ts.hour(), ts.minute(), ts.second()))
             .unwrap_or_else(|| "-".into());
 
         println!(

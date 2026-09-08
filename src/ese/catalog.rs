@@ -8,17 +8,21 @@
 //! database versions, so the column definitions are hardcoded here rather than
 //! being bootstrapped from a higher-level catalog page.
 
-use forensic_rs::err::{ForensicError, ForensicResult};
+use std::collections::HashMap;
+
+use forensic_rs::err::ForensicResult;
+use forensic_rs::traits::db::ForensicColumnDef;
 
 use crate::ese::{
     column::{ColumnDef, ColumnType, ColumnValue, TableSchema},
     header::Header,
-    page::{
-        root::RootEntry,
-        Page, TreePage,
-    },
     reader::PageReader,
+    tree,
 };
+
+/// The catalog B-tree root page — always page 4 (the first page after the
+/// two header shadow pages and the DbTime page).
+const CATALOG_ROOT_PAGE: u32 = 4;
 
 // ─── MSysObjects column IDs and schema ──────────────────────────────────────
 
@@ -94,6 +98,11 @@ pub struct TableDef {
     pub lv_fdp_page: Option<u32>,
     /// Decoded column definitions for this table, sorted by column ID.
     pub columns: Vec<ColumnDef>,
+    /// `columns`, mapped to `forensic_rs`'s column-type vocabulary and
+    /// index-aligned with it. Precomputed once here (rather than per-call in
+    /// `ForensicTable::columns()`) since that trait method returns a `&[_]`
+    /// slice and so needs a stable owner.
+    pub(crate) forensic_columns: Vec<ForensicColumnDef>,
     /// Decoded index definitions (names only; full key spec not decoded here).
     pub indexes: Vec<String>,
 }
@@ -117,8 +126,7 @@ pub struct Catalog {
 impl Catalog {
     /// Parse the catalog from a raw database byte slice.
     ///
-    /// `db` must be the full file contents; `header` must already have been
-    /// parsed with `Header::from_buff`.
+    /// `header` must already have been parsed with `Header::from_buff`.
     ///
     /// The catalog B-tree is always rooted at page 4 (the first page after the
     /// two header shadow pages and the DbTime page).
@@ -127,7 +135,14 @@ impl Catalog {
 
         // Collect all leaf entries from the catalog B-tree (rooted at page 4).
         let mut leaf_entries: Vec<OwnedRow> = Vec::new();
-        collect_leaf_entries(reader, header, 4, &mut leaf_entries, &schema, 0)?;
+        tree::visit_leaves(reader, header, CATALOG_ROOT_PAGE, |entry| {
+            if let crate::ese::page::entries::PageEntry::TableValue(tv) = entry {
+                let decoded = schema.decode_record(tv, None);
+                if let Some(row) = OwnedRow::from_decoded(&decoded) {
+                    leaf_entries.push(row);
+                }
+            }
+        })?;
 
         // Build the catalog: first pass = tables, second pass = columns / indexes.
         let mut tables: Vec<TableDef> = Vec::new();
@@ -146,18 +161,26 @@ impl Catalog {
                 table_id: row.col_id as u32,
                 lv_fdp_page: None,
                 columns: Vec::new(),
+                forensic_columns: Vec::new(),
                 indexes: Vec::new(),
             });
         }
+        // Index tables by ID for O(1) lookup during the second pass, instead
+        // of a linear `iter_mut().find()` scan per catalog row.
+        let table_index: HashMap<u32, usize> = tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.table_id, i))
+            .collect();
 
-        // Second pass: column rows (Type == 2).
+        // Second pass: column rows (Type == 2), index rows, LV rows.
         for row in &leaf_entries {
+            let Some(&idx) = table_index.get(&(row.objid_table as u32)) else { continue };
             match row.obj_type {
                 CatalogObjectType::Column => {
-                    // Find the owning table by ObjidTable (object ID, not FDP page).
-                    if let Some(tbl) = tables.iter_mut().find(|t| t.table_id == row.objid_table as u32) {
-                        if let Some(ct) = ColumnType::from_u8(row.coltyp_or_pgno as u8) {
-                            tbl.columns.push(ColumnDef {
+                    match ColumnType::from_u8(row.coltyp_or_pgno as u8) {
+                        Some(ct) => {
+                            tables[idx].columns.push(ColumnDef {
                                 id: row.col_id as u16,
                                 col_type: ct,
                                 name: row.name.clone(),
@@ -165,26 +188,42 @@ impl Catalog {
                                 codepage: row.pages_or_locale as u32,
                             });
                         }
+                        None => {
+                            forensic_rs::warn!(
+                                "ESE: table '{}' column '{}' has unrecognized type byte {:#04x}; column dropped",
+                                tables[idx].name, row.name, row.coltyp_or_pgno as u8
+                            );
+                        }
                     }
                 }
                 CatalogObjectType::Index => {
-                    if let Some(tbl) = tables.iter_mut().find(|t| t.table_id == row.objid_table as u32) {
-                        tbl.indexes.push(row.name.clone());
-                    }
+                    tables[idx].indexes.push(row.name.clone());
                 }
                 CatalogObjectType::LongValue => {
                     // Associate LV B-tree root page with its owning table.
-                    if let Some(tbl) = tables.iter_mut().find(|t| t.table_id == row.objid_table as u32) {
-                        tbl.lv_fdp_page = Some(row.coltyp_or_pgno as u32);
-                    }
+                    tables[idx].lv_fdp_page = Some(row.coltyp_or_pgno as u32);
                 }
                 _ => {}
             }
         }
 
-        // Sort columns by ID for deterministic lookup.
+        // Sort columns by ID for deterministic lookup, then precompute the
+        // forensic-rs column-type projection alongside.
         for tbl in &mut tables {
             tbl.columns.sort_by_key(|c| c.id);
+            tbl.forensic_columns = tbl
+                .columns
+                .iter()
+                .map(|c| ForensicColumnDef {
+                    name: c.name.clone(),
+                    col_type: c.col_type.forensic_type(),
+                    // ESE catalog flags encode nullability, but the exact bit
+                    // (JET_bitColumnNotNULL) is unverified against a primary
+                    // source in this codebase; default to `true` (nullable)
+                    // rather than assert a constraint that might be wrong.
+                    nullable: true,
+                })
+                .collect();
         }
 
         Ok(Catalog { tables })
@@ -192,8 +231,7 @@ impl Catalog {
 
     /// Find a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&TableDef> {
-        let name_lc = name.to_lowercase();
-        self.tables.iter().find(|t| t.name.to_lowercase() == name_lc)
+        self.tables.iter().find(|t| t.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -257,75 +295,6 @@ impl OwnedRow {
     }
 }
 
-// ─── Internal: B-tree traversal ─────────────────────────────────────────────
-
-/// Recursively collect all leaf entries from the B-tree rooted at `page_n`.
-fn collect_leaf_entries(
-    reader: &dyn PageReader,
-    header: &Header,
-    page_n: u32,
-    out: &mut Vec<OwnedRow>,
-    schema: &TableSchema,
-    depth: u32,
-) -> ForensicResult<()> {
-    if depth > 32 {
-        return Err(ForensicError::bad_format_str("Catalog B-tree depth exceeds 32 (cycle?)"));
-    }
-
-    let page = load_page(reader, header, page_n)?;
-
-    if !page.valid_page() || page.empty_page() {
-        return Ok(());
-    }
-
-    let tree = page.process_page()?;
-
-    match tree {
-        TreePage::Leaf(leaf) => {
-            for entry in &leaf.entries {
-                if let crate::ese::page::entries::PageEntry::TableValue(ref tv) = entry.data {
-                    let decoded = schema.decode_record(tv, None);
-                    if let Some(row) = OwnedRow::from_decoded(&decoded) {
-                        out.push(row);
-                    }
-                }
-            }
-        }
-        TreePage::Branch(branch) => {
-            for entry in &branch.entries {
-                collect_leaf_entries(reader, header, entry.child_page_number, out, schema, depth + 1)?;
-            }
-        }
-        TreePage::Root(root) => {
-            for entry in &root.entries {
-                match entry {
-                    RootEntry::Branch(b) => {
-                        collect_leaf_entries(reader, header, b.child_page_number, out, schema, depth + 1)?
-                    }
-                    RootEntry::Leaf(leaf_entry) => {
-                        if let crate::ese::page::entries::PageEntry::TableValue(ref tv) = leaf_entry.data {
-                            let decoded = schema.decode_record(tv, None);
-                            if let Some(row) = OwnedRow::from_decoded(&decoded) {
-                                out.push(row);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Load a single page via the reader.
-fn load_page<'r>(reader: &'r dyn PageReader, header: &Header, page_n: u32) -> ForensicResult<Page<'r>> {
-    let offset = header.page_to_file_offset(page_n as u64) as usize;
-    let size = header.page_size as usize;
-    let data = reader.read_page(offset, size)?;
-    Page::new(data, page_n, header)
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -335,8 +304,8 @@ mod tst {
 
     #[test]
     fn catalog_from_system_identity() {
-        let (db, header) = get_mdb_and_header();
-        let reader = crate::ese::reader::SliceReader(db);
+        let Some((db, header)) = get_mdb_and_header() else { return };
+        let reader = crate::ese::reader::SliceReader::new(db);
         let catalog = Catalog::from_db(&reader, &header)
             .expect("catalog parse should succeed");
         assert!(
@@ -345,22 +314,20 @@ mod tst {
         );
         for tbl in &catalog.tables {
             assert!(!tbl.name.is_empty(), "table name must not be empty");
-            // Every table should have at least one column decoded from the catalog.
-            // (MSysObjects itself has none here because it's not stored as a user table.)
+            assert_eq!(tbl.columns.len(), tbl.forensic_columns.len());
         }
     }
 
     #[test]
     fn catalog_from_ual_current() {
-        let (db, header) = get_mdb_and_header_ual();
-        let reader = crate::ese::reader::SliceReader(db);
+        let Some((db, header)) = get_mdb_and_header_ual() else { return };
+        let reader = crate::ese::reader::SliceReader::new(db);
         let catalog = Catalog::from_db(&reader, &header)
             .expect("catalog parse should succeed for UAL/Current.mdb");
         assert!(
             !catalog.tables.is_empty(),
             "expected at least one table in UAL Current.mdb catalog"
         );
-        // UAL databases typically contain tables like "CLIENTS", "DNS", "ROLE_ACCESS", etc.
         for tbl in &catalog.tables {
             println!("  table: {} (fdp_page={}) columns={}", tbl.name, tbl.fdp_page, tbl.columns.len());
         }
