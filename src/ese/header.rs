@@ -3,6 +3,8 @@
 
 use forensic_rs::{err::{ForensicError, ForensicResult}, utils::time::ForensicTimestamp};
 
+use super::lgpos::Lgpos;
+use super::signature::{LogTimestamp, Signature};
 use super::time::LogTime;
 
 pub const ESE_HEADER_SIGNATURE : u32 = 0x89abcdef;
@@ -118,6 +120,65 @@ pub struct HeaderRpr {
     pub flags : u32
 }
 
+/// Wraps one of the header's six 24-byte backup-info blocks. Every block is
+/// all-zero on every fixture available at the time this was written, so its
+/// internal layout is not asserted -- only exposed raw, plus a best-effort,
+/// explicitly-unverified interpretation for a caller willing to accept that
+/// risk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BackupInfo(pub [u8; 24]);
+
+/// A `BackupInfo`'s best-effort interpretation: `LGPOS(8) + LOGTIME(8) +
+/// genLow(4) + genHigh(4)`, mirroring the shape of the header's other
+/// backup-adjacent fields. **Not verified** -- no fixture with a non-zero
+/// backup record was available when this was written; re-verify against a
+/// real backed-up database before relying on it.
+#[derive(Clone, Copy, Debug)]
+pub struct InferredBackupInfo {
+    pub position: Lgpos,
+    pub time: LogTimestamp,
+    pub min_generation: u32,
+    pub max_generation: u32,
+}
+
+impl std::fmt::Debug for BackupInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BackupInfo(")?;
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl BackupInfo {
+    pub fn is_empty(&self) -> bool {
+        self.0 == [0u8; 24]
+    }
+
+    pub fn raw(&self) -> &[u8; 24] {
+        &self.0
+    }
+
+    /// See [`InferredBackupInfo`]'s documentation on why this is
+    /// unverified. Returns `None` when [`Self::is_empty`].
+    pub fn inferred(&self) -> Option<InferredBackupInfo> {
+        if self.is_empty() {
+            return None;
+        }
+        let position = Lgpos::from_buff(&self.0[0..8]).ok()?;
+        let time_raw: [u8; 8] = self.0[8..16].try_into().ok()?;
+        let min_generation = u32::from_le_bytes(self.0[16..20].try_into().ok()?);
+        let max_generation = u32::from_le_bytes(self.0[20..24].try_into().ok()?);
+        Some(InferredBackupInfo {
+            position,
+            time: LogTimestamp::from_raw(time_raw),
+            min_generation,
+            max_generation,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Header {
     pub checksum : u32,
@@ -125,12 +186,19 @@ pub struct Header {
     pub r#type : u32,
     pub time : u64,
     pub state : u32,
-    pub position : u64,
+    /// `lgposConsistent`. Retyped from a flat `u64` in `0.2.0` to `Lgpos` in
+    /// `0.3.0` -- a breaking change, made deliberately: the field is a
+    /// packed `{ib, isec, lGeneration}` triple, and exposing it as an opaque
+    /// integer forced every caller that cared about generation/sector to
+    /// re-derive the packing by hand.
+    pub position : Lgpos,
     pub shutdown_datetime : ForensicTimestamp,
     pub attach_datetime : ForensicTimestamp,
-    pub attach_position : u64,
+    /// `lgposAttach`. Retyped in `0.3.0`; see [`Self::position`].
+    pub attach_position : Lgpos,
     pub detach_datetime : ForensicTimestamp,
-    pub detach_position : u64,
+    /// `lgposDetach`. Retyped in `0.3.0`; see [`Self::position`].
+    pub detach_position : Lgpos,
     pub dbid : u32,
     pub shadowin_disabled : u32,
     pub last_object_id : u32,
@@ -144,7 +212,14 @@ pub struct Header {
     pub repair_datetime : ForensicTimestamp,
     pub scrub_database_time : ForensicTimestamp,
     pub scrub_datetime : ForensicTimestamp,
-    pub required_log : u64,
+    /// Low dword of the on-disk `required_log` pair (`lGenMinRequired`).
+    /// Replaces the flat `required_log: u64` field from `0.2.0` -- a
+    /// breaking change made together with the `Lgpos` retype above, for the
+    /// same reason: the packed pair was previously exposed as an opaque
+    /// integer a caller had to split by hand.
+    pub min_required_generation : u32,
+    /// High dword of the on-disk `required_log` pair (`lGenMaxRequired`).
+    pub max_required_generation : u32,
     pub upgrade_exchange : u32,
     pub upgrade_free_pages : u32,
     pub upgrade_space_map_pages : u32,
@@ -163,7 +238,28 @@ pub struct Header {
     pub commited_log : u32,
     pub nls_major_version :u32,
     pub nls_minor_version : u32,
-    pub flags : u32
+    pub flags : u32,
+    /// The database's own identity signature. Verified byte-identical to
+    /// the `signDb` embedded in an `ATTACHINFO` record in this database's
+    /// transaction logs (see [`crate::ese::log::params::AttachInfo`]).
+    pub database_signature : Signature,
+    /// The signature of the log set this database was last written against.
+    /// Verified byte-identical to every log file's and the checkpoint's own
+    /// `signLog` (see [`crate::ese::log::header::LogFileHeader`] and
+    /// [`crate::ese::log::checkpoint::Checkpoint`]) -- this is the
+    /// authoritative join key for matching a database to its log set.
+    pub log_signature : Signature,
+    pub previous_full_backup : BackupInfo,
+    pub previous_incremental_backup : BackupInfo,
+    pub current_full_backup : BackupInfo,
+    pub current_shadow_copy_backup : BackupInfo,
+    pub previous_copy_backup : BackupInfo,
+    // Preserved typo, per AGENTS.md.
+    pub pevious_differential_backup : BackupInfo,
+
+    shutdown_datetime_raw: u64,
+    attach_datetime_raw: u64,
+    detach_datetime_raw: u64,
 }
 
 /// A `LogTime` field that fails to parse (e.g. all-zero, or an out-of-range
@@ -174,6 +270,11 @@ pub struct Header {
 /// `detach_datetime`, which matter for triage, are validated separately by
 /// callers that care (see `EseDb::open`'s use of `Header::fingerprint`/`state`,
 /// which do not depend on these fields at all).
+///
+/// For a case-facing report, prefer [`Header::shutdown_time`]/
+/// [`Header::attach_time`]/[`Header::detach_time`], which return a
+/// [`LogTimestamp`] and never silently degrade an unset/invalid value to a
+/// fabricated instant.
 fn log_time_or_epoch(raw: u64) -> ForensicTimestamp {
     LogTime(raw).try_into().unwrap_or_else(|_| ForensicTimestamp::from_win_filetime(0))
 }
@@ -186,12 +287,12 @@ impl TryFrom<&HeaderRpr> for Header {
             r#type : v.r#type,
             time : v.time,
             state : v.state,
-            position : v.position,
+            position : Lgpos::from_u64_le(v.position),
             shutdown_datetime : log_time_or_epoch(v.shutdown_datetime),
             attach_datetime : log_time_or_epoch(v.attach_datetime),
-            attach_position : v.attach_position,
+            attach_position : Lgpos::from_u64_le(v.attach_position),
             detach_datetime : log_time_or_epoch(v.detach_datetime),
-            detach_position : v.detach_position,
+            detach_position : Lgpos::from_u64_le(v.detach_position),
             dbid : v.dbid,
             shadowin_disabled : v.shadowin_disabled,
             last_object_id : v.last_object_id,
@@ -205,7 +306,8 @@ impl TryFrom<&HeaderRpr> for Header {
             repair_datetime : log_time_or_epoch(v.repair_datetime),
             scrub_database_time : log_time_or_epoch(v.scrub_database_time),
             scrub_datetime : log_time_or_epoch(v.scrub_datetime),
-            required_log : v.required_log,
+            min_required_generation : v.required_log as u32,
+            max_required_generation : (v.required_log >> 32) as u32,
             upgrade_exchange : v.upgrade_exchange,
             upgrade_free_pages : v.upgrade_free_pages,
             upgrade_space_map_pages : v.upgrade_space_map_pages,
@@ -225,6 +327,17 @@ impl TryFrom<&HeaderRpr> for Header {
             nls_major_version : v.nls_major_version,
             nls_minor_version : v.nls_minor_version,
             flags : v.flags,
+            database_signature : Signature::from_buff(&v.database_signature)?,
+            log_signature : Signature::from_buff(&v.log_signature)?,
+            previous_full_backup : BackupInfo(v.previous_full_backup),
+            previous_incremental_backup : BackupInfo(v.previous_incremental_backup),
+            current_full_backup : BackupInfo(v.current_full_backup),
+            current_shadow_copy_backup : BackupInfo(v.current_shadow_copy_backup),
+            previous_copy_backup : BackupInfo(v.previous_copy_backup),
+            pevious_differential_backup : BackupInfo(v.pevious_differential_backup),
+            shutdown_datetime_raw : v.shutdown_datetime,
+            attach_datetime_raw : v.attach_datetime,
+            detach_datetime_raw : v.detach_datetime,
         })
     }
 
@@ -314,6 +427,34 @@ impl Header {
                 self.page_size as u64
             ))
     }
+
+    /// The database's shutdown time as a three-state [`LogTimestamp`],
+    /// which never silently degrades an unset/invalid value to a fabricated
+    /// instant the way [`Self::shutdown_datetime`] does. Prefer this for any
+    /// case-facing report.
+    pub fn shutdown_time(&self) -> LogTimestamp {
+        LogTimestamp::from_raw(self.shutdown_datetime_raw.to_le_bytes())
+    }
+
+    /// See [`Self::shutdown_time`].
+    pub fn attach_time(&self) -> LogTimestamp {
+        LogTimestamp::from_raw(self.attach_datetime_raw.to_le_bytes())
+    }
+
+    /// See [`Self::shutdown_time`].
+    pub fn detach_time(&self) -> LogTimestamp {
+        LogTimestamp::from_raw(self.detach_datetime_raw.to_le_bytes())
+    }
+
+    /// `true` when the database is not in a clean-shutdown state, or when
+    /// it records a nonzero required-generation range -- either condition
+    /// means the database needs transaction-log replay to reach a
+    /// consistent state.
+    pub fn requires_log_replay(&self) -> bool {
+        self.state() != DatabaseState::CleanShutdown
+            || self.min_required_generation != 0
+            || self.max_required_generation != 0
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +529,44 @@ mod tst {
         buf[PAGE_SIZE_OFF..PAGE_SIZE_OFF + 4].copy_from_slice(&32768u32.to_le_bytes());
         let header = Header::from_buff(&buf).unwrap();
         assert!(header.page_to_file_offset(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn backup_info_blocks_are_empty_and_uninferred_in_the_fixture() {
+        let Some(buffer) = load_mdb_to_memory() else { return };
+        let header = Header::from_buff(&buffer).unwrap();
+        assert!(header.previous_full_backup.is_empty());
+        assert!(header.previous_full_backup.inferred().is_none());
+    }
+
+    #[test]
+    fn requires_log_replay_is_false_for_a_clean_shutdown_with_no_required_generations() {
+        let Some(buffer) = load_mdb_to_memory() else { return };
+        let header = Header::from_buff(&buffer).unwrap();
+        assert_eq!(header.state(), DatabaseState::CleanShutdown);
+        assert!(!header.requires_log_replay());
+    }
+
+    #[test]
+    fn real_srum_fixture_signatures_and_lgpos_match_verified_bytes() {
+        let Ok(bytes) = std::fs::read("./artifacts/sru/SRUDB.dat") else {
+            eprintln!("SKIP: fixture unavailable");
+            return;
+        };
+        let header = Header::from_buff(&bytes).unwrap();
+
+        // Verified byte-exactly: SRUDB.dat[24..52] is the database_signature,
+        // SRUDB.dat[108..136] is the log_signature.
+        assert_eq!(&header.database_signature.raw[..], &bytes[24..52]);
+        assert_eq!(&header.log_signature.raw[..], &bytes[108..136]);
+
+        assert_eq!(header.position, super::Lgpos { generation: 185, sector: 4, byte: 835 });
+        assert_eq!(header.attach_position, super::Lgpos { generation: 185, sector: 3, byte: 616 });
+        assert_eq!(header.detach_position, super::Lgpos { generation: 185, sector: 4, byte: 835 });
+        assert_eq!(header.min_required_generation, 0);
+        assert_eq!(header.max_required_generation, 0);
+        assert_eq!(header.commited_log, 0);
+        assert_eq!(header.state(), DatabaseState::CleanShutdown);
+        assert!(!header.requires_log_replay());
     }
 }

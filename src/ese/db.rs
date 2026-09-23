@@ -102,6 +102,14 @@ impl EseDb {
         &self.catalog
     }
 
+    /// The underlying page reader. Crate-internal: lets sibling modules
+    /// (currently [`crate::ese::recovery`]) drive their own B-tree walks
+    /// with [`crate::ese::tree::TreeWalker`] the same way [`RowIter`] does,
+    /// without duplicating `EseDb`'s construction logic.
+    pub(crate) fn reader(&self) -> &dyn PageReader {
+        self.reader.as_ref()
+    }
+
     /// Names of all user tables found in the catalog.
     pub fn table_names(&self) -> Vec<&str> {
         self.catalog.tables.iter().map(|t| t.name.as_str()).collect()
@@ -121,6 +129,43 @@ impl EseDb {
     /// caller) return just a cursor.
     pub fn rows(&self, name: &str) -> ForensicResult<RowIter<'_>> {
         Ok(self.table(name)?.iter_rows())
+    }
+
+    /// Rows for `table` still addressable via the page tag array but marked
+    /// deleted (`TAG_DEFUNCT`). See [`crate::ese::recovery`] for the scope
+    /// and soundness policy, and [`Self::recovered_slack_rows`] for the
+    /// second (riskier) recovery source.
+    pub fn recovered_rows(
+        &self,
+        table: &str,
+    ) -> ForensicResult<(Vec<crate::ese::recovery::RecoveredRow>, crate::ese::recovery::RecoveryStats)> {
+        crate::ese::recovery::defunct::recover_defunct_rows(self, table)
+    }
+
+    /// Candidate rows for `table` found in live pages' unallocated slack
+    /// (the region between a page's used data and its tag array). See
+    /// [`crate::ese::recovery::slack`] for why this source applies a
+    /// stricter admission bar than [`Self::recovered_rows`].
+    pub fn recovered_slack_rows(
+        &self,
+        table: &str,
+    ) -> ForensicResult<(Vec<crate::ese::recovery::RecoveredRow>, crate::ese::recovery::RecoveryStats)> {
+        crate::ese::recovery::slack::recover_slack_rows(self, table)
+    }
+
+    /// Group `table`'s live and recovered rows by `key_columns`, so every
+    /// version of "the same" logical row (current, deleted, slack-carved)
+    /// is visible together, with disagreement surfaced rather than
+    /// resolved. See [`crate::ese::recovery::history`] for why the key is
+    /// caller-supplied rather than auto-detected, and for the scan
+    /// diagnostics and per-source skip counts the returned report carries
+    /// alongside the groupings themselves.
+    pub fn row_history(
+        &self,
+        table: &str,
+        key_columns: &[&str],
+    ) -> ForensicResult<crate::ese::recovery::history::RowHistoryReport> {
+        crate::ese::recovery::history::row_history(self, table, key_columns)
     }
 
     /// Look up (or build and cache) the long-value store rooted at `lv_page`.
@@ -187,6 +232,7 @@ impl<'db> Table<'db> {
             lv_store,
             walker: TreeWalker::new(self.def.fdp_page),
             pending: Vec::new(),
+            current_locus: None,
         }
     }
 }
@@ -204,8 +250,11 @@ pub struct RowIter<'db> {
     schema: TableSchema,
     lv_store: Option<Arc<LongValueStore>>,
     walker: TreeWalker,
-    /// Rows decoded from the current leaf page, waiting to be yielded.
-    pending: Vec<Row>,
+    /// Rows decoded from the current leaf page, waiting to be yielded, each
+    /// with the `(page, tag)` it was decoded from.
+    pending: Vec<(Row, u32, u16)>,
+    /// `(page, tag)` of the row most recently returned by `next()`.
+    current_locus: Option<(u32, u16)>,
 }
 
 impl<'db> Iterator for RowIter<'db> {
@@ -214,15 +263,17 @@ impl<'db> Iterator for RowIter<'db> {
     fn next(&mut self) -> Option<Row> {
         loop {
             // Yield any buffered rows first.
-            if let Some(row) = self.pending.pop() {
+            if let Some((row, page, tag)) = self.pending.pop() {
+                self.current_locus = Some((page, tag));
                 return Some(row);
             }
 
             let page = self.walker.next_page(self.db.reader.as_ref(), &self.db.header)?;
+            let page_number = page.page_number;
             match page.process_page() {
                 Ok(tree) => {
                     self.walker.push_children(&tree);
-                    self.process_tree_page(&tree);
+                    self.process_tree_page(&tree, page_number);
                 }
                 Err(e) => {
                     forensic_rs::debug!("ESE: cannot process page {}: {e}", page.page_number);
@@ -240,6 +291,13 @@ impl<'db> RowIter<'db> {
         self.walker.stats()
     }
 
+    /// `(page, tag)` the row most recently returned by `next()` was decoded
+    /// from — the address a `Locus::Record` needs. `None` before the first
+    /// `next()`.
+    pub fn current_locus(&self) -> Option<(u32, u16)> {
+        self.current_locus
+    }
+
     fn decode_tv(
         schema: &TableSchema,
         lv_store: Option<&LongValueStore>,
@@ -253,13 +311,27 @@ impl<'db> RowIter<'db> {
         Row::from_pairs(cols)
     }
 
-    fn process_tree_page(&mut self, tree: &crate::ese::page::TreePage<'_>) {
+    fn process_tree_page(&mut self, tree: &crate::ese::page::TreePage<'_>, page_number: u32) {
         // Leaf entries decode in reverse so `pending.pop()` yields them in
         // forward (on-disk) order.
         let mut decoded = Vec::new();
-        tree::for_each_leaf_entry(tree, |entry| {
-            if let PageEntry::TableValue(tv) = entry {
-                decoded.push(Self::decode_tv(&self.schema, self.lv_store.as_deref(), tv));
+        tree::for_each_leaf_page_entry(tree, |entry| {
+            // Defunct-tagged entries are deleted rows the engine has not yet
+            // reclaimed. `leaf_entries()` still decodes them (the recovery
+            // sources need exactly these), but ordinary iteration must be an
+            // allocated-only view: yielding them here would let a
+            // `ForensicRows` cursor report `allocated() == true` for a
+            // deleted row, which grades it as trustworthy as a live read.
+            // Reach them through `EseDb::as_recovery()` instead.
+            if entry.defunct {
+                return;
+            }
+            if let PageEntry::TableValue(tv) = &entry.data {
+                decoded.push((
+                    Self::decode_tv(&self.schema, self.lv_store.as_deref(), tv),
+                    page_number,
+                    entry.tag_index,
+                ));
             }
         });
         decoded.reverse();

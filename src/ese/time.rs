@@ -8,6 +8,7 @@
 
 use forensic_rs::{err::ForensicError, utils::time::ForensicTimestamp};
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LogTime(pub u64);
 
 impl TryFrom<LogTime> for ForensicTimestamp {

@@ -17,7 +17,7 @@ use forensic_rs::err::ForensicResult;
 
 use super::{
     header::Header,
-    page::{entries::PageEntry, root::RootEntry, Page, TreePage},
+    page::{entries::PageEntry, leaf::LeafPageEntry, root::RootEntry, Page, TreePage},
     reader::PageReader,
 };
 
@@ -135,22 +135,33 @@ impl TreeWalker {
 /// Invoke `f` once per leaf entry found in `tree` — collapses the
 /// `TreePage::Leaf` and `TreePage::Root`-with-leaf-entries arms that every
 /// consumer previously duplicated.
-pub fn for_each_leaf_entry<'e>(tree: &TreePage<'e>, mut f: impl FnMut(&PageEntry<'e>)) {
+///
+/// Yields the whole [`LeafPageEntry`], so a caller can see each entry's
+/// `tag_index`/`defunct` alongside its decoded data. Callers that only need
+/// the payload should use [`for_each_leaf_entry`].
+pub fn for_each_leaf_page_entry<'e>(tree: &TreePage<'e>, mut f: impl FnMut(&LeafPageEntry<'e>)) {
     match tree {
         TreePage::Leaf(leaf) => {
             for entry in &leaf.entries {
-                f(&entry.data);
+                f(entry);
             }
         }
         TreePage::Root(root) => {
             for entry in &root.entries {
                 if let RootEntry::Leaf(leaf_entry) = entry {
-                    f(&leaf_entry.data);
+                    f(leaf_entry);
                 }
             }
         }
         TreePage::Branch(_) => {}
     }
+}
+
+/// Invoke `f` once per leaf entry's decoded payload. See
+/// [`for_each_leaf_page_entry`] when the entry's tag index or defunct flag
+/// matters.
+pub fn for_each_leaf_entry<'e>(tree: &TreePage<'e>, mut f: impl FnMut(&PageEntry<'e>)) {
+    for_each_leaf_page_entry(tree, |entry| f(&entry.data));
 }
 
 /// Eagerly walk every leaf entry of the B-tree rooted at `root_page`,

@@ -3,7 +3,7 @@
 
 use forensic_rs::err::{ForensicError, ForensicResult};
 
-use crate::ese::{page::entries::table_value::TableValueEntry, tag::{TagData, TAG_COMMON_KEY}};
+use crate::ese::{page::entries::table_value::TableValueEntry, tag::{TagData, TAG_COMMON_KEY, TAG_DEFUNCT}};
 
 use super::{entries::{index::IndexEntry, long_value::LongValueEntry, space_tree::SpaceTreeEntry, PageEntry}, Page};
 
@@ -25,6 +25,20 @@ pub struct LeafPageEntry<'a> {
     pub page_key : &'a [u8],
     pub child_page_number : u32,
     pub data : PageEntry<'a>,
+    /// Index of the page tag this entry was decoded from — the `slot` half of
+    /// [`forensic_rs::provenance::Locus::Record`], so a row can name the exact
+    /// byte address it came from.
+    pub tag_index : u16,
+    /// The engine marked this entry's tag [`TAG_DEFUNCT`] (deleted) but has
+    /// not yet reclaimed its bytes.
+    ///
+    /// Retained here rather than filtered out in [`Self::leaf_entries`] on
+    /// purpose: that function stays the faithful "every tag on this page"
+    /// primitive that `recovery::defunct` needs. Deciding what a defunct entry
+    /// *means* belongs to the caller — `RowIter` skips them so ordinary
+    /// iteration is an allocated-only view, while the recovery sources look
+    /// for exactly these.
+    pub defunct : bool,
 }
 
 impl<'a> LeafPageHeader<'a> {
@@ -92,7 +106,9 @@ impl<'a> LeafPageEntry<'a> {
             common_key_size,
             page_key : local_key,
             child_page_number : 0,
-            data : entry
+            data : entry,
+            tag_index : tag as u16,
+            defunct : tag_flags & TAG_DEFUNCT != 0,
         })
     }
 

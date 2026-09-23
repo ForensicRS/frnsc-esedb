@@ -10,7 +10,9 @@ Target Windows artifacts: **SRUM** (System Resource Usage Monitor), **UAL** (Use
 
 Implements [`forensic-rs`](https://github.com/ForensicRS/forensic-rs)'s `ForensicDb`/`ForensicTable`/`ForensicRows` traits and `FormatFactory` (see [Framework Integration](#framework-integration) below), so any tool built on the framework can read an ESE database without knowing this crate exists — the same analyzer runs unmodified against a live file, an in-memory buffer, or a mounted evidence item.
 
-> **Work in Progress** — This library is under active development (v0.2.0). The core parsing engine is functional and well-tested, but the API may evolve before reaching a stable 1.0 release. It will be published to [crates.io](https://crates.io) once stable.
+> **Work in Progress** — This library is under active development (v0.3.0). The core parsing engine is functional and well-tested, but the API may evolve before reaching a stable 1.0 release. It will be published to [crates.io](https://crates.io) once stable.
+
+Beyond the database file itself, `frnsc_esedb::ese::log` parses the surrounding **file set** — transaction logs (`.log`/`.jrs`), the checkpoint (`.chk`), and the flush map (`.jfm`) — and aggregates them into a log-set integrity report (`EseLogSet::report()`): which generations are present, whether the database needs log replay, and any anomalies found, each paired with the benign explanation an examiner should rule out first. `frnsc_esedb::ese::recovery` recovers rows absent from ordinary iteration — rows still addressable via a page's tag array but marked deleted, and candidates carved from a live page's unallocated slack — each citing the exact bytes it came from, and can group a table's live and recovered rows into a per-key history (`EseDb::row_history`) or export recovered rows to an opt-in JSONL sidecar. See `docs/internals.md` §11 and `examples/log_set.rs`/`examples/recover_rows.rs`/`examples/row_history.rs`.
 
 ## Installation
 
@@ -102,14 +104,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `EseDb` implements three `forensic-rs` traits, so it plugs directly into a triage pipeline or any tool written against the framework rather than against this crate:
 
 - **`ForensicDb` / `ForensicTable` / `ForensicRows`** (`forensic_rs::traits::db`) — the unified database-access trait. `db.list_tables()`, `db.table(name)?.iter_rows()?`, and `row.read_ref(i)` work exactly as they would for any other `ForensicDb` implementor (e.g. a SQLite backend).
-- **`FormatFactory`** ([`EseFormatFactory`], `forensic_rs::traits::format`) — content-sniffs a file (checking the ESE magic signature and a sanity-checked header) and mounts it as `Mounted::Database`, without the caller needing to know in advance that a given file is an ESE database. Small files are slurped into memory for zero-copy page access; files larger than the resolver's in-memory budget stream pages on demand instead.
+- **`RecoverRows`** (`forensic_rs::traits::db`) — `db.as_recovery()` always returns `Some(self)`; `recovered_rows(table)`/`slack_rows(table)` return an ordinary `ForensicRows` cursor whose rows report `allocated() == false` and a real `recovery()`/`locus()`, so recovered rows are reachable without knowing `EseDb`'s concrete type.
+- **`FormatFactory`** ([`EseFormatFactory`], `forensic_rs::traits::format`) — content-sniffs a file (checking the ESE magic signature and a sanity-checked header) and mounts it as `Mounted::Database`, without the caller needing to know in advance that a given file is an ESE database. Small files are slurped into memory for zero-copy page access; files larger than the resolver's in-memory budget stream pages on demand instead. [`EseLogSetFactory`] is a second, independent `FormatFactory` over the same file, yielding `Mounted::FileSet` — the database's transaction logs, checkpoint, flush map, and reserved logs grouped by filename shape.
 
 ## API Overview
 
 All key types are re-exported at the crate root:
 
 ```rust
-use frnsc_esedb::{EseDb, Table, Row, RowIter, ColumnDef, ColumnType, ColumnValue, OwnedColumnValue, EseFormatFactory};
+use frnsc_esedb::{EseDb, Table, Row, RowIter, ColumnDef, ColumnType, ColumnValue, OwnedColumnValue, EseFormatFactory, EseLogSetFactory};
 ```
 
 ### `EseDb` — Database Handle

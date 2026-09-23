@@ -58,7 +58,10 @@ directly via `align_to::<HeaderRpr>()`.  Because it is `packed`, every field is
 read at its exact offset with no padding.  The overlay is then converted to the
 safe `Header` struct via `TryFrom<&HeaderRpr>`.
 
-Key fields and their offsets (all little-endian unless noted):
+Key fields and their offsets (all little-endian unless noted). **Verified
+against a real header** (`artifacts/sru/SRUDB.dat`) rather than taken from
+the field-declaration order alone — the two do not always agree, and an
+earlier revision of this table got several of these offsets wrong:
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -67,11 +70,15 @@ Key fields and their offsets (all little-endian unless noted):
 | 8 | 4 | `version` | Format version (e.g. `0x620` or `0x623`) |
 | 12 | 4 | `type` | Header type (1 = database header, 2 = log) |
 | 16 | 8 | `time` | Last modification time (LogTime encoding) |
-| 28 | 4 | `state` | Database state code |
-| 68 | 4 | `last_object_id` | Highest object ID allocated |
-| 72 | 4 | `major_version`, `minor_version` | Engine version |
-| 84 | 4 | `file_format_revision` | Format revision (determines page layout) |
-| 88 | 4 | `page_size` | Page size in bytes |
+| 24 | 28 | `database_signature` | This database's own 28-byte `SIGNATURE`; see §11 |
+| 52 | 4 | `state` | Database state code |
+| 56 | 8 | `position` | `lgposConsistent` — an `Lgpos` (`{ib, isec, lGeneration}`), not a plain integer |
+| 108 | 28 | `log_signature` | The `signLog` of the log set this database was last written against; see §11 |
+| 212 | 4 | `last_object_id` | Highest object ID allocated |
+| 216 | 8 | `major_version`, `minor_version` | Engine version |
+| 232 | 4 | `file_format_revision` | Format revision (determines page layout) |
+| 236 | 4 | `page_size` | Page size in bytes |
+| 296 | 8 | `required_log` | Packed `{lGenMinRequired: u32, lGenMaxRequired: u32}` pair |
 
 The constant `ESE_HEADER_SIGNATURE = 0x89ABCDEF` is the magic number checked to
 confirm the file is a valid ESE database.
@@ -84,12 +91,18 @@ pub struct Header {
     pub version: u32,
     pub file_format_revision: u32,
     pub state: u32,
-    // … timestamps as Filetime, backup ranges, ECC counters …
+    pub position: Lgpos,           // retyped in 0.3.0 — see §11
+    pub database_signature: Signature,
+    pub log_signature: Signature,
+    // … timestamps as ForensicTimestamp, backup ranges (BackupInfo), ECC counters …
 }
 ```
 
-`Header` replaces all raw `u64` LogTime fields with `Filetime` (from
-`forensic-rs`) and drops the fields that are not relevant to parsing.
+`Header` replaces all raw `u64` LogTime fields with `forensic_rs::utils::time::ForensicTimestamp`
+and, as of `0.3.0`, retypes the packed `position`/`attach_position`/
+`detach_position`/`required_log` fields (previously exposed as opaque
+integers) into `Lgpos` and a `min_required_generation`/`max_required_generation`
+pair — see §11 for why, and for `Signature`/`Lgpos` themselves.
 
 ### 2.3 Format fingerprint
 
@@ -131,15 +144,22 @@ ESE stores timestamps in a compact 8-byte format packed as:
 byte[0] = seconds (0–59)
 byte[1] = minutes (0–59)
 byte[2] = hours   (0–23)
-byte[3] = day     (1–31)
-byte[4] = month   (0–11, 0 = January)
+byte[3] = day     (1–31, 1-based)
+byte[4] = month   (1–12, 1-based)
 byte[5] = year − 1900
-byte[6] = weekday
-byte[7] = reserved
+byte[6..8] = undecoded (bit layout not verified; see §11's `LogTimestamp`)
 ```
 
-`LogTime(u64)` in `src/ese/time.rs` implements `TryFrom<LogTime> for Filetime`,
+Both `day` and `month` are **1-based**, not 0-based — verified against a real
+header (`shutdown_datetime` decodes to 2020-11-09: byte 3 = 9, byte 4 = 11).
+
+`LogTime(u64)` in `src/ese/time.rs` implements `TryFrom<LogTime> for ForensicTimestamp`,
 converting to Windows FILETIME (100-nanosecond intervals since 1601-01-01).
+`Header`'s own conversion (`log_time_or_epoch`) degrades an unparseable value
+to the Unix epoch, which is safe for the noisy ECC/scrub diagnostic fields it
+was written for but was deliberately **not** reused for the file-set layer in
+§11 — see `LogTimestamp` there for why a case-facing timestamp must never be
+silently defaulted.
 
 ---
 
@@ -678,7 +698,225 @@ pub struct Row {
 
 ---
 
-## 11. Zero-Copy Design & Lifetimes
+## 11. ESE File Set: Transaction Logs, Checkpoint, Flush Map, Recovery
+
+An ESE database is a *file set*, not a single file. Everything in this
+section is implemented in `src/ese/log/` and `src/ese/recovery/`, and every
+byte offset and algorithm below was verified directly against
+`artifacts/sru/` (`SRUDB.dat` + its full log set) rather than inferred.
+
+### 11.1 `Lgpos` and `Signature` — the two linchpin types
+
+`Lgpos` (`src/ese/lgpos.rs`) is a log position: on disk, `{ib: u16, isec: u16,
+lGeneration: u32}` (8 bytes, in that field order). The type re-orders its
+fields to `{generation, sector, byte}` so `#[derive(Ord)]` sorts the way an
+examiner actually needs — `(generation, sector, byte)`, not the on-disk
+order, which would sort by byte offset first and silently break every
+"is the checkpoint before the write frontier" comparison.
+
+`Signature` (`src/ese/signature.rs`) is the 28-byte `SIGNATURE` structure —
+`{u32 random; LOGTIME created; u8 computer_name[16]}` — used as the
+authoritative, filename-independent join key across the whole file set:
+a database's `log_signature` (header offset 108), every log file's `signLog`
+(offset `0x2c`), and the checkpoint's `signLog` (offset `0x14`) are all
+verified byte-identical in a healthy set. A database's `database_signature`
+(header offset 24) is likewise verified byte-identical to the `signDb`
+embedded in its logs' `ATTACHINFO` records (§11.4).
+
+`LogTimestamp` is a three-state decode of the packed `LOGTIME` (`Unset` /
+`Present { time, raw }` / `Invalid { raw }`) — deliberately not a plain
+`ForensicTimestamp`, so a case-facing report can never render a fabricated
+instant for a field that was actually absent or malformed (contrast
+`Header::log_time_or_epoch`, §2.5).
+
+### 11.2 `LOGFILEHDR` — the first sector of every `.log`
+
+| Off | Type | Field | Verified value (`SRU.log`) |
+|---|---|---|---|
+| 0x00 | u32 | `ulChecksum` | `0x89abcdef ^ XOR(u32 @ 4..cbSec)` |
+| 0x04 | u32 | `lGeneration` | 185 |
+| 0x08 | u16 | `cbSec` | 4096 |
+| 0x0a | u16 | `csecHeader` | 1 |
+| 0x0c | u16 | `csecLGFile` | 16 (`16 × 4096 == 65536 ==` file size) |
+| 0x0e | u16 | `cbPageSize` | 4096 (== the attached database's `page_size`) |
+| 0x10 | LOGTIME | `tmCreate` | — |
+| 0x18 | LOGTIME | `tmPrevGen` | — |
+| 0x20/24/28 | u32 ×3 | version triple | 8 / 4000 / 5 |
+| 0x2c | SIGNATURE | `signLog` | — |
+
+`tmPrevGen(generation N) == tmCreate(generation N-1)`, compared as raw bytes
+(not just to one-second resolution), holds byte-exactly across the entire
+verified chain 185→184→183→182→181.
+
+### 11.3 Log data sectors — self-identifying, and two things that look alike but aren't
+
+Every sector from index `csecHeader` onward carries, at `+0x08`, an `Lgpos`
+naming **its own** position, and at `+0x10` a `LOGTIME`. This is what makes
+[`crate::ese::log::sector::SectorClass`] possible:
+
+- **`Live`**: `generation == header generation` and `sector == physical
+  index`.
+- **`Shadow { of }`**: `generation` matches but `sector` doesn't — ESE's
+  torn-write guard, duplicating the frontier sector one slot further along.
+  Benign.
+- **`Stale { generation }`**: `generation` differs from the header's —
+  residual data from a previous life of a recycled log file. Forensically
+  significant: `SRU.log` carries 32 KiB of residual generation-180 data past
+  its own write frontier (sectors 7–14), and `SRUtmp.log` holds a *complete*
+  generation 181 whose archived file no longer exists.
+
+**Classification tests generation before `isec`.** `SRU000B8.log` sector 15
+has `isec == 14` — shadow-shaped — but `generation == 174`, sixteen
+generations stale. Testing `isec` first silently relabels verified residual
+evidence as a benign shadow.
+
+The checkpoint file itself has an analogous whole-file redundancy: `SRU.chk`
+(8192 bytes) is two byte-identical 4096-byte halves.
+
+### 11.4 `DBMS_PARAM` / `ATTACHINFO` — one structure, two different base offsets
+
+The region following a log header's or checkpoint's fixed prefix carries the
+recorded system/log paths and one record per attached database — but at a
+**different base offset** in each file kind: `0x48` in a `.log` (right after
+`signLog`), `0x30` in a `.chk`. Worse, the offset from that base to the first
+`ATTACHINFO` record is 568 in the log and 600 in the checkpoint. Because of
+this, [`crate::ese::log::params::LogParams::scan`] finds records via a
+bounded structural scan rather than a fixed offset, validating each
+candidate's `Lgpos`, embedded `Signature` (requiring a `Present`, not merely
+non-`Invalid`, `LOGTIME` — accepting `Unset` was verified to manufacture a
+spurious second attachment out of ordinary zero-padding), and UTF-16LE path
+shape before accepting it.
+
+### 11.5 Checksums
+
+Both algorithms below are verified byte-exactly against every log/checkpoint
+file in `artifacts/sru/`. Anything without a verified algorithm — a `.jfm`
+header, a log data sector's own stored checksum — reports
+`ChecksumVerdict::NotVerified`, never a guessed `Match`.
+
+```
+log_file_header_checksum = 0x89abcdef ^ xor32_le(sector0[4..cbSec])
+checkpoint_checksum      = xor32_le(file[4..])
+```
+
+### 11.6 Log-set discovery and the integrity report
+
+A database's log-set base name is **not derivable from the database's own
+filename** — `SRUDB.dat`'s logs are `SRU*.log`, not `SRUDB*.log`. Discovery
+(`EseLogSet::discover`) therefore groups files by their shared `signLog`
+first, and only recovers a base-name label second (`set.rs`'s
+`strip_log_role`).
+
+`EseLogSet::report()` produces a `LogSetReport` whose `#[non_exhaustive]`
+`LogAnomaly` enum carries, per variant, observed-vs-expected values and a
+`benign_explanation()` — the innocent explanation an examiner should rule
+out first, kept in the type so it cannot be lost between analysis and
+report. Confirmed-benign cases that must never fire as anomalies: a
+zero-filled `.jrs` failing a checksum rule (classified before checksumming
+even applies); `SRUtmp.log` sharing a generation number with an archived
+file (`DuplicateGeneration` explicitly excludes temp files — recycling an
+old generation into the temp slot is normal); a generation gap below the
+database's required-replay range (`Info`, not `Medium` — ESE routinely
+deletes logs below the checkpoint).
+
+### 11.7 Value recovery (`src/ese/recovery/`)
+
+Two sources are implemented, both scoped to pages still linked into a live
+table B-tree:
+
+- **`recovery::defunct::recover_defunct_rows`** — rows whose page tag is
+  marked [`crate::ese::tag::TAG_DEFUNCT`]. Reliable evidence on its own: the
+  engine itself wrote and flagged the tag on deletion.
+- **`recovery::slack::recover_slack_rows`** — candidate records found in a
+  page's unallocated slack (the region between used data and the tag
+  array), with **no** governing tag. Structural plausibility alone.
+
+Both funnel through one admission gate
+(`recovery::validate::decode_and_admit`), which decodes a candidate through
+the exact same path the live row iterator uses
+(`TableSchema::decode_record`), validated against only the schema of the
+table owning the page; a candidate that fails to parse, or decodes to too
+few *meaningful* columns, is silently dropped rather than reported with
+lower confidence (the policy — and its wording — comes from this crate's
+closest precedent, `frnsc-hive`'s deleted-cell carving).
+
+`recovery::validate::is_meaningful` is stricter than "not `Nil`": a decoded
+numeric **zero** does not count as meaningful, because it is byte-for-byte
+indistinguishable from unwritten padding reinterpreted as that column type.
+This was found by a failing test, not by inspection — a synthetic slack
+candidate with one genuinely-populated column and one absent column was
+admitted anyway, because the absent column decoded as a "non-null" zero
+rather than `Nil`. `slack::recover_slack_rows` additionally requires **two**
+meaningful columns, not `defunct`'s one, since a slack candidate has no
+governing tag to lean on for corroboration.
+
+Slack candidates also never decode a tagged/overflow region: a candidate's
+byte slice is truncated to exactly its own declared `variable_data_offset`
+before being handed to `TableValueEntry::new`, so there is no governing tag
+to say where the record legitimately ends, and nothing past that
+self-declared boundary is ever interpreted as column data.
+
+**A verified, honest finding on this crate's own fixture — confirmed twice
+over.** A naive whole-file scan finds 14 pages that look defunct-tagged, and
+a separate whole-file scan finds 537 KB of non-zero page slack — but
+*neither* is reachable from any table's data tree, LV tree, or the catalog
+tree (every tree together accounts for only 145,818 bytes of slack, all of
+it zero). Both are fully unlinked (freed) pages, or pages belonging to
+untracked trees (secondary indexes), whose old leaf content the engine never
+wiped. `EseDb`'s `RecoverRows::recovered_rows()`/`slack_rows()` correctly
+report zero for every table on this fixture as a result — a different,
+riskier recovery source (carving at the freed-page level) than "a page still
+linked into a live tree", which is what both implemented sources require.
+See `recovery::defunct`'s and `recovery::slack`'s test modules for both the
+synthetic proof each mechanism works and this fixture's honest zero.
+
+Recovered rows travel through the ordinary `ForensicRows` cursor, not a
+parallel type: `EseDb::as_recovery()` always returns `Some(self)`, and the
+cursor `recovered_rows()`/`slack_rows()` return reports `allocated() ==
+false` plus a real per-row `recovery()` (`forensic_rs::provenance::Recovery`)
+and `locus()` (`forensic_rs::provenance::Locus::Record` for a defunct tag,
+`Locus::PageOffset` for a slack candidate — there is no tag to put in `slot`,
+but there is a real page, so it is not flattened to a bare `RawOffset`).
+`RecoveredRow` is a type alias for `forensic_rs::recovery::Recovered<Row>`
+(no `Deref`; use `.value()`/`.into_value()`). The cursor also reports the
+scan's own diagnostics via `ForensicRows::scan_report()` — units scanned,
+candidates found/admitted/rejected — converted from the same `RecoveryStats`
+the scan functions have always computed (`RecoveryStats::to_report()`), so
+that information no longer dead-ends at the trait boundary the way it used
+to when only the crate's own inherent API existed.
+
+`recovery::history::row_history` groups a table's live and recovered rows by
+a **caller-supplied** key (not auto-detected — the catalog's `TableDef::indexes`
+is names only, with no column list, so there is no honest way to derive a
+grouping key today), and `RowHistory::is_disputed` reports disagreement
+between versions without resolving it. This stays an inherent method rather
+than `RecoverRows::row_history`, which the trait documents as rows recovered
+by replaying a transaction log — a mechanism this crate deliberately does
+not implement (see below); that trait method is left at its `EmptyRows`
+default. `recovery::sidecar::export_recovered`/`export_recovered_to_files`
+export recovered rows to caller-supplied writers or paths — never written by
+default — through `forensic_rs::pipeline::sinks::ProvenanceJsonlSink`, which
+mints a real `forensic_rs::provenance::ProvenanceId` per row from a
+`ProvenanceStore` and grades `Confidence` from `(Acquisition, Recovery)`
+rather than this crate asserting one; each row's `Locus` is still emitted as
+explicit fields alongside a deterministic `EventId`, since `Locus` itself
+never reaches the provenance side table.
+
+Deliberately out of scope, and why: individual log-record (LR) decoding
+(page-image deltas keyed by `(dbid, objid, pgno)`, ~60 version-gated types —
+a wrong delta produces a page that still validates and still decodes rows,
+silently wrong, with no independent ground truth in this crate's fixtures to
+check against) — and, for the same reason, log-borne row recovery, which
+would need the identical capability; the `.jfm` page-flush-state bitmap
+(layout undetermined); the log data-sector checksum (confirmed not a
+XOR-fold); and log replay itself (an analyst wants to know *that* and
+*which* generations are required, via
+`Header::requires_log_replay`/`EseLogSet::missing_generations`, not to have
+this crate mutate the evidence's logical state).
+
+---
+
+## 12. Zero-Copy Design & Lifetimes
 
 All page-derived types carry a `'a` lifetime tied to the owning `Page::data`
 buffer:
